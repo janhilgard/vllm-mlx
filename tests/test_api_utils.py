@@ -438,3 +438,47 @@ class TestExtractMultimodalContent:
         processed, images, videos = extract_multimodal_content(messages)
         assert "First part." in processed[0]["content"]
         assert "Second part." in processed[0]["content"]
+
+
+class TestGptOssSpecialTokens:
+    """Tests for GPT-OSS channel token handling in utils."""
+
+    def test_pattern_matches_channel_token(self):
+        assert SPECIAL_TOKENS_PATTERN.search("<|channel|>") is not None
+
+    def test_pattern_matches_message_token(self):
+        assert SPECIAL_TOKENS_PATTERN.search("<|message|>") is not None
+
+    def test_pattern_matches_start_token(self):
+        assert SPECIAL_TOKENS_PATTERN.search("<|start|>") is not None
+
+    def test_pattern_matches_return_token(self):
+        assert SPECIAL_TOKENS_PATTERN.search("<|return|>") is not None
+
+    def test_pattern_matches_call_token(self):
+        assert SPECIAL_TOKENS_PATTERN.search("<|call|>") is not None
+
+    def test_clean_output_extracts_final_channel(self):
+        text = (
+            "<|channel|>analysis<|message|>Thinking about it"
+            "<|start|>assistant<|channel|>final<|message|>The answer is 42<|return|>"
+        )
+        result = clean_output_text(text)
+        assert result == "The answer is 42"
+        assert "<|" not in result
+
+    def test_clean_output_final_only(self):
+        text = "<|channel|>final<|message|>Just the answer<|return|>"
+        result = clean_output_text(text)
+        assert result == "Just the answer"
+
+    def test_clean_output_strips_return_token(self):
+        text = "<|channel|>final<|message|>Hello world<|return|>"
+        result = clean_output_text(text)
+        assert "<|return|>" not in result
+        assert result == "Hello world"
+
+    def test_clean_output_no_channel_tokens_passthrough(self):
+        text = "Normal text without any channel tokens."
+        result = clean_output_text(text)
+        assert result == text
