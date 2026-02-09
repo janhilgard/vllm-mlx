@@ -525,7 +525,8 @@ def build_json_system_prompt(
     if format_type == "json_object":
         return (
             "You must respond with valid JSON only. "
-            "Do not include any explanation or text outside the JSON object."
+            "Output the JSON object directly without any explanation, "
+            "reasoning, or markdown formatting."
         )
 
     if format_type == "json_schema":

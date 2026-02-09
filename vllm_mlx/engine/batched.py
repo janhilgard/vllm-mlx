@@ -430,8 +430,13 @@ class BatchedEngine(BaseEngine):
                 top_p=top_p,
             )
 
+            text = (
+                output.output_text
+                if self.skip_output_cleaning
+                else clean_output_text(output.output_text)
+            )
             return GenerationOutput(
-                text=clean_output_text(output.output_text),
+                text=text,
                 prompt_tokens=output.prompt_tokens,
                 completion_tokens=output.completion_tokens,
                 finish_reason=output.finish_reason,
@@ -452,7 +457,11 @@ class BatchedEngine(BaseEngine):
             sampling_params=sampling_params,
         )
 
-        text = clean_output_text(output.output_text)
+        text = (
+            output.output_text
+            if self.skip_output_cleaning
+            else clean_output_text(output.output_text)
+        )
 
         return GenerationOutput(
             text=text,
@@ -504,7 +513,11 @@ class BatchedEngine(BaseEngine):
 
             async for output in self._mllm_scheduler.stream_outputs(request_id):
                 yield GenerationOutput(
-                    text=clean_output_text(output.output_text),
+                    text=(
+                        output.output_text
+                        if self.skip_output_cleaning
+                        else clean_output_text(output.output_text)
+                    ),
                     new_text=output.new_text,
                     prompt_tokens=output.prompt_tokens,
                     completion_tokens=output.completion_tokens,
@@ -531,7 +544,11 @@ class BatchedEngine(BaseEngine):
         )
 
         async for output in self._engine.stream_outputs(request_id):
-            text = clean_output_text(output.output_text)
+            text = (
+                output.output_text
+                if self.skip_output_cleaning
+                else clean_output_text(output.output_text)
+            )
 
             yield GenerationOutput(
                 text=text,

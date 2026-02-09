@@ -141,8 +141,12 @@ class SimpleEngine(BaseEngine):
                 **kwargs,
             )
 
-            # Clean output text
-            text = clean_output_text(output.text)
+            # Clean output text (skip when reasoning parser handles it)
+            text = (
+                output.text
+                if self.skip_output_cleaning
+                else clean_output_text(output.text)
+            )
 
             return GenerationOutput(
                 text=text,
@@ -278,7 +282,11 @@ class SimpleEngine(BaseEngine):
                     temperature=temperature,
                     **kwargs,
                 )
-                text = clean_output_text(output.text)
+                text = (
+                    output.text
+                    if self.skip_output_cleaning
+                    else clean_output_text(output.text)
+                )
                 return GenerationOutput(
                     text=text,
                     prompt_tokens=output.prompt_tokens,
@@ -297,7 +305,11 @@ class SimpleEngine(BaseEngine):
                     tools=template_tools,
                     **kwargs,
                 )
-                text = clean_output_text(output.text)
+                text = (
+                    output.text
+                    if self.skip_output_cleaning
+                    else clean_output_text(output.text)
+                )
                 return GenerationOutput(
                     text=text,
                     tokens=output.tokens,

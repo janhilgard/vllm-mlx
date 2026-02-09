@@ -67,6 +67,21 @@ class BaseEngine(ABC):
     def preserve_native_tool_format(self, value: bool) -> None:
         self._preserve_native_tool_format = value
 
+    @property
+    def skip_output_cleaning(self) -> bool:
+        """
+        Whether to skip clean_output_text() in the engine layer.
+
+        When True, output text is returned raw — the server layer handles
+        cleaning after reasoning extraction and tool parsing.
+        Set by server when a reasoning parser is enabled.
+        """
+        return getattr(self, "_skip_output_cleaning", False)
+
+    @skip_output_cleaning.setter
+    def skip_output_cleaning(self, value: bool) -> None:
+        self._skip_output_cleaning = value
+
     @abstractmethod
     async def start(self) -> None:
         """Start the engine (load model if not loaded)."""

@@ -172,6 +172,12 @@ def serve_command(args):
         max_tokens=args.max_tokens,
     )
 
+    # When reasoning parser is active, skip engine-level output cleaning
+    # so the parser receives raw text with channel/structural tokens intact
+    if server._reasoning_parser and server._engine is not None:
+        server._engine.skip_output_cleaning = True
+        logger.info("Engine output cleaning disabled (reasoning parser handles it)")
+
     # Start server
     print(f"Starting server at http://{args.host}:{args.port}")
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")

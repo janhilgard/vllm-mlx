@@ -1399,6 +1399,16 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     if response_format and not tool_calls:
         json_input = cleaned_text or output.text
         _, parsed_json, is_valid, error = parse_json_output(json_input, response_format)
+        if parsed_json is None and reasoning_text and output.text:
+            # Reasoning parser may have moved JSON into reasoning_content.
+            # Fallback: try extracting JSON from the raw output text.
+            _, parsed_json, is_valid, error = parse_json_output(
+                output.text, response_format
+            )
+            if parsed_json is not None:
+                logger.info(
+                    "JSON extracted from raw output text (fallback after reasoning split)"
+                )
         if parsed_json is not None:
             # Return JSON as string
             cleaned_text = json.dumps(parsed_json)
@@ -2277,6 +2287,12 @@ Examples:
         max_tokens=args.max_tokens,
         force_mllm=args.mllm,
     )
+
+    # When reasoning parser is active, skip engine-level output cleaning
+    # so the parser receives raw text with channel/structural tokens intact
+    if _reasoning_parser and _engine is not None:
+        _engine.skip_output_cleaning = True
+        logger.info("Engine output cleaning disabled (reasoning parser handles it)")
 
     # Start server
     uvicorn.run(app, host=args.host, port=args.port)

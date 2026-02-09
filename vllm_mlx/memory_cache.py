@@ -233,25 +233,77 @@ class _CacheEntry:
         )
 
 
-def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
-    """Create shallow copies of KVCache layers with offset reduced by *trim_by*.
+def _has_non_trimmable_layers(cache: list[Any], trim_by: int) -> bool:
+    """Check if any cache layer cannot be safely trimmed by *trim_by* tokens.
 
-    This is used when returning a cached KV state to the scheduler so that
-    the last N positions are "freed" and the model will recompute them on the
-    next forward pass (preventing duplicate KV entries).
+    A layer is non-trimmable when:
+    - It lacks the expected ``offset`` / ``keys`` attributes (e.g. MambaCache).
+    - It is a ``RotatingKVCache`` whose circular buffer has already rotated
+      (``offset > max_size``).  In that case the earliest positions have been
+      overwritten and we cannot reconstruct the earlier KV state.
     """
-    from mlx_lm.models.cache import KVCache
+    from mlx_lm.models.cache import RotatingKVCache
+
+    for lc in cache:
+        if not (hasattr(lc, "offset") and hasattr(lc, "keys")):
+            return True
+        if isinstance(lc, RotatingKVCache):
+            max_size = getattr(lc, "max_size", None)
+            if max_size is not None and lc.offset > max_size:
+                return True
+    return False
+
+
+def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
+    """Create copies of cache layers with offset reduced by *trim_by*.
+
+    The key/value tensors are sliced to match the new offset so that
+    tensor shapes stay consistent with the offset value.  Each layer's
+    original class is preserved (``KVCache`` stays ``KVCache``,
+    ``RotatingKVCache`` stays ``RotatingKVCache``) so that downstream
+    ``merge()`` calls produce the correct batch-cache type.
+
+    **Important**: callers must first verify the trim is safe via
+    ``_has_non_trimmable_layers``.  This function assumes all layers
+    are safely trimmable (non-rotated).
+    """
+    from mlx_lm.models.cache import KVCache, RotatingKVCache
 
     trimmed: list[Any] = []
     for layer_cache in cache:
-        if hasattr(layer_cache, "offset") and hasattr(layer_cache, "keys"):
-            tc = KVCache.__new__(KVCache)
-            tc.keys = layer_cache.keys
-            tc.values = layer_cache.values
-            tc.offset = max(layer_cache.offset - trim_by, 0)
-            trimmed.append(tc)
-        else:
+        if not (hasattr(layer_cache, "offset") and hasattr(layer_cache, "keys")):
             trimmed.append(layer_cache)
+            continue
+
+        new_offset = max(layer_cache.offset - trim_by, 0)
+
+        if isinstance(layer_cache, RotatingKVCache):
+            tc = RotatingKVCache.__new__(RotatingKVCache)
+            tc.step = getattr(layer_cache, "step", RotatingKVCache.step)
+            tc.keep = getattr(layer_cache, "keep", 0)
+            tc.max_size = layer_cache.max_size
+            if layer_cache.keys is not None and new_offset > 0:
+                tc.keys = layer_cache.keys[:, :, :new_offset, :]
+                tc.values = layer_cache.values[:, :, :new_offset, :]
+            else:
+                tc.keys = None
+                tc.values = None
+                new_offset = 0
+            tc.offset = new_offset
+            tc._idx = new_offset
+        else:
+            tc = KVCache.__new__(KVCache)
+            tc.step = getattr(layer_cache, "step", KVCache.step)
+            if layer_cache.keys is not None and new_offset > 0:
+                tc.keys = layer_cache.keys[:, :, :new_offset, :]
+                tc.values = layer_cache.values[:, :, :new_offset, :]
+            else:
+                tc.keys = None
+                tc.values = None
+                new_offset = 0
+            tc.offset = new_offset
+
+        trimmed.append(tc)
     return trimmed
 
 
@@ -400,15 +452,12 @@ class MemoryAwarePrefixCache:
             n_requested = len(tokens)
             excess = n_cached - n_requested
 
-            has_non_trimmable = any(
-                not (hasattr(lc, "offset") and hasattr(lc, "keys"))
-                for lc in best_super.cache
-            )
+            has_non_trimmable = _has_non_trimmable_layers(best_super.cache, excess)
 
             if excess > 0 and has_non_trimmable:
                 logger.debug(
                     "[cache_fetch] supersequence match skipped: "
-                    "non-trimmable cache layers (hybrid model)"
+                    "non-trimmable cache layers (hybrid/rotated model)"
                 )
             elif excess > 0:
                 trimmed_cache = _trim_cache_offset(best_super.cache, excess)
@@ -470,10 +519,7 @@ class MemoryAwarePrefixCache:
         if best_lcp_entry is not None and best_lcp_length > 0:
             excess = len(best_lcp_entry.tokens) - best_lcp_length
 
-            has_non_trimmable = any(
-                not (hasattr(lc, "offset") and hasattr(lc, "keys"))
-                for lc in best_lcp_entry.cache
-            )
+            has_non_trimmable = _has_non_trimmable_layers(best_lcp_entry.cache, excess)
             logger.debug(
                 f"[cache_fetch] LCP candidate: lcp={best_lcp_length} "
                 f"entry_len={len(best_lcp_entry.tokens)} excess={excess} "
