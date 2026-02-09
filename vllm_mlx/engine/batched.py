@@ -208,6 +208,20 @@ class BatchedEngine(BaseEngine):
         self._model = self._mllm_instance.model
         self._processor = self._mllm_instance.processor
 
+        # Qwen3 fix: ensure correct EOS token for MLLM
+        if "qwen3" in self._model_name.lower() or "Qwen3" in self._model_name:
+            tokenizer = (
+                self._processor.tokenizer
+                if hasattr(self._processor, "tokenizer")
+                else self._processor
+            )
+            if hasattr(tokenizer, "eos_token"):
+                tokenizer.eos_token = "<|im_end|>"
+            if hasattr(tokenizer, "eos_token_id"):
+                im_end_ids = tokenizer.encode("<|im_end|>", add_special_tokens=False)
+                if im_end_ids:
+                    tokenizer.eos_token_id = im_end_ids[-1]
+
         # Create MLLM scheduler config with batch generator support
         if self._scheduler_config and hasattr(self._scheduler_config, "max_num_seqs"):
             max_num_seqs = self._scheduler_config.max_num_seqs
@@ -329,41 +343,64 @@ class BatchedEngine(BaseEngine):
         tokenizer = self.tokenizer
 
         if self._is_mllm and self._processor:
-            # Use mlx_vlm's chat template for MLLM
+            # Use processor's tokenizer to apply chat template with full message context
+            # This preserves system messages, multi-turn history, and image placeholders
             try:
-                from mlx_vlm.prompt_utils import apply_chat_template
-                from mlx_vlm.utils import load_config
-
-                config = getattr(self._model, "config", None)
-                if config is None:
-                    config = load_config(self._model_name)
-
-                # Extract text from last user message
-                text_prompt = ""
-                for msg in reversed(messages):
-                    if msg.get("role") == "user":
+                tokenizer = (
+                    self._processor.tokenizer
+                    if hasattr(self._processor, "tokenizer")
+                    else self._processor
+                )
+                if hasattr(tokenizer, "apply_chat_template"):
+                    # Build messages with image placeholders in content
+                    formatted_messages = []
+                    for msg in messages:
                         content = msg.get("content", "")
-                        if isinstance(content, str):
-                            text_prompt = content
-                        elif isinstance(content, list):
+                        role = msg.get("role", "user")
+                        if (
+                            role == "user"
+                            and num_images > 0
+                            and isinstance(content, list)
+                        ):
+                            # Build content list with image placeholders + text
+                            new_content = []
                             for item in content:
-                                if isinstance(item, str):
-                                    text_prompt = item
-                                    break
+                                if isinstance(item, dict) and item.get("type") in (
+                                    "image_url",
+                                    "image",
+                                ):
+                                    new_content.append({"type": "image"})
                                 elif (
                                     isinstance(item, dict)
                                     and item.get("type") == "text"
                                 ):
-                                    text_prompt = item.get("text", "")
-                                    break
-                        break
+                                    new_content.append(
+                                        {"type": "text", "text": item.get("text", "")}
+                                    )
+                                elif isinstance(item, str):
+                                    new_content.append({"type": "text", "text": item})
+                            formatted_messages.append(
+                                {"role": role, "content": new_content}
+                            )
+                        elif (
+                            role == "user"
+                            and num_images > 0
+                            and isinstance(content, str)
+                        ):
+                            # String content with images — prepend image placeholders
+                            new_content = [{"type": "image"} for _ in range(num_images)]
+                            new_content.append({"type": "text", "text": content})
+                            formatted_messages.append(
+                                {"role": role, "content": new_content}
+                            )
+                        else:
+                            formatted_messages.append(msg)
 
-                return apply_chat_template(
-                    self._processor,
-                    config,
-                    text_prompt,
-                    num_images=num_images,
-                )
+                    return tokenizer.apply_chat_template(
+                        formatted_messages,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    )
             except Exception as e:
                 logger.warning(f"Failed to apply MLLM chat template: {e}")
                 # Fall through to standard template

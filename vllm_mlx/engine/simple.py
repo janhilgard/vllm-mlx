@@ -280,6 +280,7 @@ class SimpleEngine(BaseEngine):
                     messages=messages,
                     max_tokens=max_tokens,
                     temperature=temperature,
+                    top_p=top_p,
                     **kwargs,
                 )
                 text = (
@@ -363,6 +364,7 @@ class SimpleEngine(BaseEngine):
                         messages=messages,
                         max_tokens=max_tokens,
                         temperature=temperature,
+                        top_p=top_p,
                         **kwargs,
                     )
                 )
