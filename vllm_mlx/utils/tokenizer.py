@@ -57,6 +57,21 @@ def load_model_with_fallback(model_name: str, tokenizer_config: dict = None):
         if "TokenizersBackend" in str(e) or "Tokenizer class" in str(e):
             logger.warning(f"Standard tokenizer loading failed, using fallback: {e}")
             return _load_with_tokenizer_fallback(model_name)
+        # Fallback for models with extra weights (e.g., MTP layers)
+        elif "parameters not in model" in str(e):
+            logger.warning(f"Extra parameters found (e.g., MTP weights), retrying with strict=False: {e}")
+            from mlx_lm.utils import _download, load_model, load_tokenizer
+            model_path = _download(model_name)
+            model, config = load_model(model_path, strict=False)
+            tokenizer = load_tokenizer(
+                model_path, tokenizer_config,
+                eos_token_ids=config.get("eos_token_id", None),
+            )
+            # Inject MTP support if model has MTP config + weights
+            if config.get("num_nextn_predict_layers", 0) > 0:
+                from ..patches.qwen3_next_mtp import inject_mtp_support
+                inject_mtp_support(model, model_path, config)
+            return model, tokenizer
         else:
             raise
 
