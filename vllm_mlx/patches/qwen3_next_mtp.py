@@ -206,7 +206,12 @@ def validate_mtp_support(model: Any) -> bool:
     mtp = getattr(model, "mtp", None)
     if mtp is None:
         num_mtp = 0
+        # Try model.args (Qwen3-Next) and model.language_model.args (Qwen3.5)
         args = getattr(model, "args", None)
+        if args is None:
+            lm = getattr(model, "language_model", None)
+            if lm is not None:
+                args = getattr(lm, "args", None)
         if args is not None:
             num_mtp = getattr(args, "num_nextn_predict_layers", 0)
         if num_mtp > 0:

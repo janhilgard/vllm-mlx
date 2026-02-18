@@ -261,9 +261,9 @@ class BatchedEngine(BaseEngine):
 
         # Validate MTP support if enabled
         if self._scheduler_config and self._scheduler_config.enable_mtp:
-            from ..patches.qwen3_next_mtp import validate_mtp_support
+            from ..patches.qwen3_next_mtp import validate_mtp_support as _validate
 
-            if validate_mtp_support(self._model):
+            if _validate(self._model):
                 logger.info("[MTP] Model validated for MTP speculative decoding")
             else:
                 logger.warning(
