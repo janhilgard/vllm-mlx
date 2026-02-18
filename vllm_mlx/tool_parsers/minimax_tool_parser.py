@@ -106,10 +106,15 @@ class MiniMaxToolParser(ToolParser):
         delta_token_ids: Sequence[int] | None = None,
         request: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
+        # Not inside a tool call block yet — pass content through
         if "<minimax:tool_call>" not in current_text:
             return {"content": delta_text}
 
-        if "</minimax:tool_call>" in delta_text:
+        # Tool call block is complete (closing tag appeared in accumulated text)
+        if (
+            "</minimax:tool_call>" in current_text
+            and "</minimax:tool_call>" not in previous_text
+        ):
             result = self.extract_tool_calls(current_text)
             if result.tools_called:
                 return {
@@ -127,4 +132,5 @@ class MiniMaxToolParser(ToolParser):
                     ]
                 }
 
+        # Inside tool call block but not yet complete — suppress output
         return None

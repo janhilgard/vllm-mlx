@@ -1981,6 +1981,16 @@ async def stream_chat_completion(
             content = delta_msg.content
             reasoning = delta_msg.reasoning
 
+            # Some models (e.g. MiniMax) wrap tool calls in <think>
+            # blocks, so reasoning parser captures tool call XML as
+            # reasoning while content stays None.  Redirect reasoning
+            # to the content stream so the tool parser can handle it.
+            if tool_parser and reasoning and not content:
+                _check = tool_accumulated_text + reasoning
+                if "<minimax:tool_call>" in _check or "<tool_call>" in _check:
+                    content = reasoning
+                    reasoning = None
+
             # Tool call parsing on content portion
             if tool_parser and content:
                 if not tool_markup_possible and "<" not in content:
