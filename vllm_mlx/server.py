@@ -1987,7 +1987,11 @@ async def stream_chat_completion(
             # to the content stream so the tool parser can handle it.
             if tool_parser and reasoning and not content:
                 _check = tool_accumulated_text + reasoning
-                if "<minimax:tool_call>" in _check or "<tool_call>" in _check:
+                if (
+                    "<minimax:tool_call>" in _check
+                    or "<tool_call>" in _check
+                    or '<invoke name="' in _check
+                ):
                     content = reasoning
                     reasoning = None
 
@@ -1995,7 +1999,10 @@ async def stream_chat_completion(
             if tool_parser and content:
                 if not tool_markup_possible and "<" not in content:
                     tool_accumulated_text += content
-                    # No tool markup yet, fall through to normal emission
+                    # Suppress whitespace-only content when tools are active;
+                    # avoids emitting stray newlines before tool call XML.
+                    if not content.strip():
+                        continue
                 else:
                     if not tool_markup_possible:
                         tool_markup_possible = True
