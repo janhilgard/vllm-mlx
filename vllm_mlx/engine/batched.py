@@ -283,7 +283,7 @@ class BatchedEngine(BaseEngine):
                     device_info.get("memory_size", 0),
                 )
                 if max_recommended > 0:
-                    soft_limit = int(max_recommended * 0.90)
+                    soft_limit = int(max_recommended * 0.95)
                     mx.set_memory_limit(soft_limit)
                     mx.set_cache_limit(32 * 1024 * 1024 * 1024)  # 32GB
                     logger.info(
@@ -480,6 +480,7 @@ class BatchedEngine(BaseEngine):
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
+            repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
             stop=stop or [],
         )
 
@@ -556,6 +557,7 @@ class BatchedEngine(BaseEngine):
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
+            repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
             stop=stop or [],
         )
 
