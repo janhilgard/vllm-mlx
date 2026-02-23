@@ -517,6 +517,7 @@ def load_model(
     stream_interval: int = 1,
     max_tokens: int = 32768,
     force_mllm: bool = False,
+    gpu_memory_utilization: float = 0.90,
 ):
     """
     Load a model (auto-detects MLLM vs LLM).
@@ -546,6 +547,7 @@ def load_model(
             scheduler_config=scheduler_config,
             stream_interval=stream_interval,
             force_mllm=force_mllm,
+            gpu_memory_utilization=gpu_memory_utilization,
         )
         # BatchedEngine will be started in lifespan (uvicorn's event loop)
         # Just log for now
@@ -1231,10 +1233,22 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
         f"prompt_chars={prompt_len} prompt_preview={prompt_preview!r}"
     )
 
+    # Resolve repetition penalty for completions
+    comp_rep_penalty = request.repetition_penalty
+    if comp_rep_penalty is None and request.frequency_penalty:
+        comp_rep_penalty = 1.0 + request.frequency_penalty
+    if comp_rep_penalty is None and request.presence_penalty:
+        comp_rep_penalty = 1.0 + request.presence_penalty
+
     if request.stream:
         return StreamingResponse(
             _disconnect_guard(
-                stream_completion(engine, prompts[0], request),
+                stream_completion(
+                    engine,
+                    prompts[0],
+                    request,
+                    repetition_penalty=comp_rep_penalty,
+                ),
                 raw_request,
             ),
             media_type="text/event-stream",
@@ -1248,14 +1262,16 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     total_prompt_tokens = 0
 
     for i, prompt in enumerate(prompts):
+        gen_kwargs = {
+            "max_tokens": request.max_tokens or _default_max_tokens,
+            "temperature": _resolve_temperature(request.temperature),
+            "top_p": _resolve_top_p(request.top_p),
+            "stop": request.stop,
+        }
+        if comp_rep_penalty is not None:
+            gen_kwargs["repetition_penalty"] = comp_rep_penalty
         output = await _wait_with_disconnect(
-            engine.generate(
-                prompt=prompt,
-                max_tokens=request.max_tokens or _default_max_tokens,
-                temperature=_resolve_temperature(request.temperature),
-                top_p=_resolve_top_p(request.top_p),
-                stop=request.stop,
-            ),
+            engine.generate(prompt=prompt, **gen_kwargs),
             raw_request,
             timeout=timeout,
         )
@@ -1387,12 +1403,21 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             # Inject JSON instruction into messages
             messages = _inject_json_instruction(messages, json_instruction)
 
+    # Resolve repetition penalty: explicit > frequency_penalty > presence_penalty
+    rep_penalty = request.repetition_penalty
+    if rep_penalty is None and request.frequency_penalty:
+        rep_penalty = 1.0 + request.frequency_penalty
+    if rep_penalty is None and request.presence_penalty:
+        rep_penalty = 1.0 + request.presence_penalty
+
     # Prepare kwargs
     chat_kwargs = {
         "max_tokens": request.max_tokens or _default_max_tokens,
         "temperature": _resolve_temperature(request.temperature),
         "top_p": _resolve_top_p(request.top_p),
     }
+    if rep_penalty is not None:
+        chat_kwargs["repetition_penalty"] = rep_penalty
 
     # Add multimodal content
     if has_media:
@@ -1862,15 +1887,18 @@ async def stream_completion(
     engine: BaseEngine,
     prompt: str,
     request: CompletionRequest,
+    repetition_penalty: float | None = None,
 ) -> AsyncIterator[str]:
     """Stream completion response."""
-    async for output in engine.stream_generate(
-        prompt=prompt,
-        max_tokens=request.max_tokens or _default_max_tokens,
-        temperature=_resolve_temperature(request.temperature),
-        top_p=_resolve_top_p(request.top_p),
-        stop=request.stop,
-    ):
+    gen_kwargs = {
+        "max_tokens": request.max_tokens or _default_max_tokens,
+        "temperature": _resolve_temperature(request.temperature),
+        "top_p": _resolve_top_p(request.top_p),
+        "stop": request.stop,
+    }
+    if repetition_penalty is not None:
+        gen_kwargs["repetition_penalty"] = repetition_penalty
+    async for output in engine.stream_generate(prompt=prompt, **gen_kwargs):
         data = {
             "id": f"cmpl-{uuid.uuid4().hex[:8]}",
             "object": "text_completion",

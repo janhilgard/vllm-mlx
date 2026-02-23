@@ -59,7 +59,14 @@ def load_model_with_fallback(model_name: str, tokenizer_config: dict = None):
             return _load_with_tokenizer_fallback(model_name)
         # Fallback for models with extra weights (e.g., MTP layers)
         elif "parameters not in model" in str(e):
-            logger.warning(f"Extra parameters found (e.g., MTP weights), retrying with strict=False: {e}")
+            logger.warning(f"Extra parameters found (e.g., MTP weights), retrying with strict=False")
+            # Clear traceback references to free memory from the failed first load.
+            # Without this, large models (200GB+) cause OOM during retry because
+            # the traceback holds references to the first load's weight tensors.
+            e.__traceback__ = None
+            del e
+            import gc
+            gc.collect()
             from mlx_lm.utils import _download, load_model, load_tokenizer
             model_path = _download(model_name)
             model, config = load_model(model_path, strict=False)

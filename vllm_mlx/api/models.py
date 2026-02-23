@@ -172,6 +172,10 @@ class ChatCompletionRequest(BaseModel):
     # MLLM-specific parameters
     video_fps: float | None = None
     video_max_frames: int | None = None
+    # Sampling penalties
+    repetition_penalty: float | None = None  # mlx-lm style (>1.0 penalizes)
+    frequency_penalty: float | None = None  # OpenAI style (0-2)
+    presence_penalty: float | None = None  # OpenAI style (0-2)
     # Request timeout in seconds (None = use server default)
     timeout: float | None = None
 
@@ -235,6 +239,10 @@ class CompletionRequest(BaseModel):
     max_tokens: int | None = None
     stream: bool = False
     stop: list[str] | None = None
+    # Sampling penalties
+    repetition_penalty: float | None = None  # mlx-lm style (>1.0 penalizes)
+    frequency_penalty: float | None = None  # OpenAI style (0-2)
+    presence_penalty: float | None = None  # OpenAI style (0-2)
     # Request timeout in seconds (None = use server default)
     timeout: float | None = None
 
