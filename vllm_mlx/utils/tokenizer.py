@@ -90,7 +90,7 @@ def load_model_with_fallback(model_name: str, tokenizer_config: dict = None):
         # Fallback for models with extra weights (e.g., MTP layers, vision tower)
         elif "parameters not in model" in str(e):
             logger.warning(
-                f"Extra parameters found (e.g., MTP/vision weights), retrying with strict=False"
+                "Extra parameters found (e.g., MTP/vision weights), retrying with strict=False"
             )
             # Clear traceback references to free memory from the failed first load.
             # Without this, large models (200GB+) cause OOM during retry because
