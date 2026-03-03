@@ -52,9 +52,7 @@ def inject_mtp_support(model: Any, model_path, config: dict) -> bool:
     model_path = Path(model_path)
     mtp_file = model_path / "model-mtp.safetensors"
     if not mtp_file.exists():
-        logger.warning(
-            f"[MTP inject] model-mtp.safetensors not found in {model_path}"
-        )
+        logger.warning(f"[MTP inject] model-mtp.safetensors not found in {model_path}")
         return False
 
     args = model.args
@@ -76,14 +74,11 @@ def inject_mtp_support(model: Any, model_path, config: dict) -> bool:
             self.pre_fc_norm_embedding = nn.RMSNorm(
                 args.hidden_size, eps=args.rms_norm_eps
             )
-            self.fc = nn.Linear(
-                args.hidden_size * 2, args.hidden_size, bias=False
-            )
+            self.fc = nn.Linear(args.hidden_size * 2, args.hidden_size, bias=False)
             # MTP decoder uses full attention (not linear/delta-net)
             fa_idx = args.full_attention_interval - 1
             self.layers = [
-                Qwen3NextDecoderLayer(args, layer_idx=fa_idx)
-                for _ in range(n_layers)
+                Qwen3NextDecoderLayer(args, layer_idx=fa_idx) for _ in range(n_layers)
             ]
             self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 

@@ -154,9 +154,7 @@ class EngineCore:
         # Emergency memory pressure threshold — dynamic based on gpu_memory_utilization
         _gpu_mem_util = self.config.gpu_memory_utilization
         try:
-            _device_mem = mx.device_info().get(
-                "memory_size", 200 * 1024 * 1024 * 1024
-            )
+            _device_mem = mx.device_info().get("memory_size", 200 * 1024 * 1024 * 1024)
             _memory_pressure_threshold = int(
                 _device_mem * min(_gpu_mem_util + 0.05, 0.99)
             )
@@ -249,6 +247,7 @@ class EngineCore:
                 break
             except Exception as e:
                 import traceback
+
                 logger.error(f"Engine loop error: {e}\n{traceback.format_exc()}")
                 await asyncio.sleep(0.1)
 
