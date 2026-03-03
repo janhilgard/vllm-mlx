@@ -134,9 +134,8 @@ MLLM_PATTERNS = [
     "InternVL",  # InternVL
     "deepseek-vl",
     "DeepSeek-VL",  # DeepSeek-VL
-    # NOTE: Qwen3.5 is natively multimodal but MoE produces ArraysCache
-    # which is incompatible with MLLM continuous batching (requires KVCache).
-    # Runs as text-only via strict=False fallback until upstream fixes this.
+    "Qwen3.5-",
+    "qwen3_5",  # Qwen3.5 MoE (natively multimodal, hybrid ArraysCache+KVCache)
 ]
 
 
