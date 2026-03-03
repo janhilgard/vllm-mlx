@@ -623,7 +623,7 @@ class MLLMScheduler:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Error in MLLM process loop: {e}")
+                logger.error(f"Error in MLLM process loop: {e}", exc_info=True)
                 await asyncio.sleep(0.1)
 
     async def add_request_async(

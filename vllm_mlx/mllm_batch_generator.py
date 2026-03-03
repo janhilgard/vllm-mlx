@@ -327,6 +327,11 @@ class MLLMBatchGenerator:
                 "MLLMBatchGenerator: Model does not have language_model, using model directly"
             )
 
+        # Patch Qwen3.5 attention for BatchKVCache compatibility
+        from .patches.qwen3_5_mllm import patch_qwen35_attention_for_batching
+
+        patch_qwen35_attention_for_batching()
+
         self.max_tokens = max_tokens
         self.stop_tokens = stop_tokens or set()
         self.sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
