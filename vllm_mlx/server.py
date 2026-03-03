@@ -42,6 +42,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import secrets
 import tempfile
 import threading
@@ -157,6 +158,11 @@ _reasoning_parser = None  # ReasoningParser instance when enabled
 _enable_auto_tool_choice: bool = False
 _tool_call_parser: str | None = None  # Parser name: auto, mistral, qwen, llama, hermes
 _tool_parser_instance = None  # Instantiated parser
+
+# Pattern to strip leaked tool call markup from content output.
+# Safety net: the tool parser should consume these, but if it doesn't
+# (e.g. malformed JSON, stray closing tags), strip them before emitting.
+_TOOL_MARKUP_PATTERN = re.compile(r"</?tool_call>|</?tool_call_reasoning>")
 
 
 def _load_prefix_cache_from_disk() -> None:
@@ -2097,6 +2103,9 @@ async def stream_chat_completion(
 
                     # Normal content from tool parser
                     content = tool_result.get("content", "")
+                    # Strip any leaked tool markup tags
+                    if content:
+                        content = _TOOL_MARKUP_PATTERN.sub("", content)
 
             chunk = ChatCompletionChunk(
                 id=response_id,
@@ -2187,6 +2196,9 @@ async def stream_chat_completion(
 
                     # Normal content from tool parser
                     content = tool_result.get("content", "")
+                    # Strip any leaked tool markup tags
+                    if content:
+                        content = _TOOL_MARKUP_PATTERN.sub("", content)
 
             chunk = ChatCompletionChunk(
                 id=response_id,

@@ -18,7 +18,8 @@ SPECIAL_TOKENS_PATTERN = re.compile(
     r"<\|end\|>|<\|eot_id\|>|<\|start_header_id\|>|<\|end_header_id\|>|"
     r"<\|channel\|>|<\|message\|>|<\|start\|>|<\|return\|>|<\|call\|>|<\|constrain\|>|"
     r"</s>|<s>|<pad>|\[PAD\]|\[SEP\]|\[CLS\]|"
-    r"\[e~\[|\]~b\][a-z]*|\]~!b\["
+    r"\[e~\[|\]~b\][a-z]*|\]~!b\[|"
+    r"</?tool_call>|</?tool_call_reasoning>"
 )
 
 
@@ -133,6 +134,9 @@ MLLM_PATTERNS = [
     "InternVL",  # InternVL
     "deepseek-vl",
     "DeepSeek-VL",  # DeepSeek-VL
+    # NOTE: Qwen3.5 is natively multimodal but MoE produces ArraysCache
+    # which is incompatible with MLLM continuous batching (requires KVCache).
+    # Runs as text-only via strict=False fallback until upstream fixes this.
 ]
 
 
