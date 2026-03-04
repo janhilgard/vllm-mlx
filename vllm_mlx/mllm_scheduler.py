@@ -792,8 +792,27 @@ class MLLMScheduler:
                 self.batch_generator.get_vision_cache_stats()
             )
 
-        if self.vision_cache:
-            stats["vision_cache"] = self.vision_cache.get_stats()
+        if self.vision_cache is not None:
+            vc_stats = self.vision_cache.get_stats()
+            stats["vision_cache"] = vc_stats
+            # Expose vision cache in the same format as memory_aware_cache
+            # so the /v1/status endpoint (and monitoring UI) can display it.
+            stats["memory_aware_cache"] = {
+                "hits": vc_stats.get("hits", 0),
+                "misses": vc_stats.get("misses", 0),
+                "hit_rate": round(vc_stats.get("hit_rate", 0), 4),
+                "evictions": vc_stats.get("evictions", 0),
+                "tokens_saved": vc_stats.get("tokens_saved", 0),
+                "current_memory_mb": round(vc_stats.get("memory_used_mb", 0), 2),
+                "max_memory_mb": round(vc_stats.get("max_memory_mb", 0), 2),
+                "memory_utilization": round(
+                    vc_stats.get("memory_used_mb", 0) / vc_stats.get("max_memory_mb", 1)
+                    if vc_stats.get("max_memory_mb", 0) > 0
+                    else 0,
+                    4,
+                ),
+                "entry_count": vc_stats.get("entries", 0),
+            }
 
         # Include Metal memory stats
         try:
