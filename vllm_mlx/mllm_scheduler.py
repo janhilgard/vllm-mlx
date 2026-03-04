@@ -446,6 +446,27 @@ class MLLMScheduler:
             if request is None:
                 continue
 
+            # Handle error responses from failed preprocessing
+            if response.finish_reason == "error":
+                output = RequestOutput(
+                    request_id=request_id,
+                    new_token_ids=[],
+                    new_text="",
+                    output_token_ids=[],
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    finished=True,
+                    finish_reason="error",
+                )
+                request.status = RequestStatus.FINISHED_ABORTED
+                request.output_text = ""
+                request.finish_reason = "error"
+                finished_ids.add(request_id)
+                self.num_requests_processed += 1
+                logger.warning(f"Request {request_id} failed during preprocessing")
+                outputs.append(output)
+                continue
+
             # Append token to request
             request.output_tokens.append(response.token)
             request.num_output_tokens = len(request.output_tokens)
