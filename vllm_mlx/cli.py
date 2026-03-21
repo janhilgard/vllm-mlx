@@ -205,7 +205,6 @@ def serve_command(args):
         max_tokens=args.max_tokens,
         force_mllm=getattr(args, "mllm", False),
         gpu_memory_utilization=args.gpu_memory_utilization,
-        force_mllm=args.mllm,
         served_model_name=args.served_model_name,
         mtp=args.enable_mtp,
         prefill_step_size=args.prefill_step_size,
