@@ -37,7 +37,6 @@ from .mllm_batch_generator import (
 )
 from .multimodal_processor import MultimodalProcessor
 from .request import RequestOutput, RequestStatus, SamplingParams
-from .mllm_cache import MLLMCacheManager
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +61,8 @@ class MLLMSchedulerConfig:
     default_max_tokens: int = 256
     # Default video FPS for frame extraction
     default_video_fps: float = 2.0
+    # KV cache memory limit (from --cache-memory-mb)
+    cache_memory_mb: Optional[int] = None
     # Maximum video frames
     max_video_frames: int = 128
 
@@ -175,13 +176,6 @@ class MLLMScheduler:
             processor=processor,
             config=self.model_config,
         )
-
-        # Vision cache for repeated images
-        self.vision_cache: Optional[MLLMCacheManager] = None
-        if self.config.enable_vision_cache:
-            self.vision_cache = MLLMCacheManager(
-                max_entries=self.config.vision_cache_size
-            )
 
         # Get stop tokens from tokenizer
         self.stop_tokens = self._get_stop_tokens()
@@ -807,44 +801,55 @@ class MLLMScheduler:
         if self.batch_generator is not None:
             batch_stats = self.batch_generator.stats()
             stats["batch_generator"] = batch_stats.to_dict()
-            # Add vision embedding cache stats from batch generator
-            stats["vision_embedding_cache"] = (
-                self.batch_generator.get_vision_cache_stats()
-            )
-
-        if self.vision_cache is not None:
-            vc_stats = self.vision_cache.get_stats()
-            stats["vision_cache"] = vc_stats
-            # Expose vision cache in the same format as memory_aware_cache
-            # so the /v1/status endpoint (and monitoring UI) can display it.
-            stats["memory_aware_cache"] = {
-                "hits": vc_stats.get("hits", 0),
-                "misses": vc_stats.get("misses", 0),
-                "hit_rate": round(vc_stats.get("hit_rate", 0), 4),
-                "evictions": vc_stats.get("evictions", 0),
-                "tokens_saved": vc_stats.get("tokens_saved", 0),
-                "current_memory_mb": round(vc_stats.get("memory_used_mb", 0), 2),
-                "max_memory_mb": round(vc_stats.get("max_memory_mb", 0), 2),
-                "memory_utilization": round(
-                    (
-                        vc_stats.get("memory_used_mb", 0)
-                        / vc_stats.get("max_memory_mb", 1)
-                        if vc_stats.get("max_memory_mb", 0) > 0
-                        else 0
-                    ),
-                    4,
-                ),
-                "entry_count": vc_stats.get("entries", 0),
-            }
+            # Vision embedding cache stats from batch generator
+            vec_stats = self.batch_generator.get_vision_cache_stats()
+            stats["vision_embedding_cache"] = vec_stats
 
         # Include Metal memory stats
         try:
             if mx.metal.is_available():
-                stats["metal_active_memory_gb"] = round(mx.get_active_memory() / 1e9, 2)
-                stats["metal_peak_memory_gb"] = round(mx.get_peak_memory() / 1e9, 2)
-                stats["metal_cache_memory_gb"] = round(mx.get_cache_memory() / 1e9, 2)
+                active_gb = round(mx.get_active_memory() / 1e9, 2)
+                peak_gb = round(mx.get_peak_memory() / 1e9, 2)
+                cache_gb = round(mx.get_cache_memory() / 1e9, 2)
+                stats["metal_active_memory_gb"] = active_gb
+                stats["metal_peak_memory_gb"] = peak_gb
+                stats["metal_cache_memory_gb"] = cache_gb
         except Exception:
-            pass
+            active_gb = 0
+            cache_gb = 0
+
+        # Build KV cache stats for /v1/status and monitoring UI.
+        # Combine Metal KV cache memory with vision embedding cache hits.
+        max_mb = float(self.config.cache_memory_mb or 0)
+        current_mb = round(cache_gb * 1024, 2)
+        vec_stats = (
+            self.batch_generator.get_vision_cache_stats()
+            if self.batch_generator
+            else {}
+        )
+        hits = vec_stats.get("pixel_cache_hits", 0) + vec_stats.get(
+            "encoding_cache_hits", 0
+        )
+        misses = vec_stats.get("pixel_cache_misses", 0) + vec_stats.get(
+            "encoding_cache_misses", 0
+        )
+        total = hits + misses
+        entries = (
+            vec_stats.get("pixel_cache_size", 0)
+            + vec_stats.get("pixel_only_cache_size", 0)
+            + vec_stats.get("encoding_cache_size", 0)
+        )
+        stats["memory_aware_cache"] = {
+            "hits": hits,
+            "misses": misses,
+            "hit_rate": round(hits / total, 4) if total > 0 else 0.0,
+            "evictions": 0,
+            "tokens_saved": 0,
+            "current_memory_mb": current_mb,
+            "max_memory_mb": max_mb,
+            "memory_utilization": round(current_mb / max_mb, 4) if max_mb > 0 else 0.0,
+            "entry_count": entries,
+        }
 
         return stats
 

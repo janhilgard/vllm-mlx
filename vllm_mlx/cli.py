@@ -193,6 +193,7 @@ def serve_command(args):
         scheduler_config=scheduler_config,
         stream_interval=args.stream_interval if args.continuous_batching else 1,
         max_tokens=args.max_tokens,
+        force_mllm=getattr(args, "mllm", False),
         gpu_memory_utilization=args.gpu_memory_utilization,
     )
 
@@ -687,6 +688,11 @@ Examples:
         "--continuous-batching",
         action="store_true",
         help="Enable continuous batching for multiple concurrent users (slower for single user)",
+    )
+    serve_parser.add_argument(
+        "--mllm",
+        action="store_true",
+        help="Force loading as MLLM (multimodal language model)",
     )
     serve_parser.add_argument(
         "--gpu-memory-utilization",
