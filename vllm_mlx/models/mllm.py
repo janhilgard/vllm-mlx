@@ -465,8 +465,9 @@ def save_base64_image(base64_string: str) -> str:
     """Save base64 image to temp file and return path. Caches identical images."""
     import hashlib
 
-    # Hash the base64 string to check cache
-    image_hash = hashlib.md5(base64_string[:1000].encode()).hexdigest()
+    # Hash the full base64 string to prevent collisions between images
+    # with identical headers (e.g. JPEG images sharing first 1000 chars)
+    image_hash = hashlib.sha256(base64_string.encode()).hexdigest()
 
     # Return cached path if available and file still exists
     if image_hash in _base64_image_cache:
@@ -1151,12 +1152,18 @@ class MLXMultimodalLM:
             logger.info(
                 f"  Chat msg {i}: role={cm['role']}, content={content_preview}..."
             )
+        # Extract tools from kwargs for chat template
+        tools = kwargs.pop("tools", None)
         try:
             # Use get_chat_template directly since messages are already properly formatted
+            template_kwargs = {"enable_thinking": True}
+            if tools:
+                template_kwargs["tools"] = tools
             formatted_prompt = get_chat_template(
                 self.processor,
                 chat_messages,
                 add_generation_prompt=True,
+                **template_kwargs,
             )
         except Exception as e:
             logger.warning(
@@ -1502,12 +1509,18 @@ class MLXMultimodalLM:
             all_images.extend(frames)
 
         # Apply chat template directly - messages are already properly structured
+        # Extract tools from kwargs for chat template
+        tools = kwargs.pop("tools", None)
         try:
             # Use get_chat_template directly since messages are already properly formatted
+            template_kwargs = {"enable_thinking": True}
+            if tools:
+                template_kwargs["tools"] = tools
             formatted_prompt = get_chat_template(
                 self.processor,
                 chat_messages,
                 add_generation_prompt=True,
+                **template_kwargs,
             )
         except Exception as e:
             logger.warning(

@@ -659,14 +659,14 @@ class MLLMBatchGenerator:
         )
         self._stats.prompt_tokens += total_prompt_tokens
 
-        # Guard against excessive memory usage during cache merge.
-        # Each token in the batch requires KV entries across all layers.
+        # Log large prompts for monitoring (was previously a hard check that
+        # caused infinite retry loops when requests exceeded the limit).
         max_batch_tokens = self.prefill_step_size * len(requests)
         if total_prompt_tokens > max_batch_tokens:
-            raise ValueError(
-                f"Total prompt tokens ({total_prompt_tokens}) exceeds safe limit "
-                f"({max_batch_tokens}) for {len(requests)} requests. "
-                f"Reduce prompt length or batch size."
+            logger.warning(
+                f"Large batch prefill: {total_prompt_tokens} tokens "
+                f"(step_size={self.prefill_step_size}, requests={len(requests)}). "
+                f"Processing may be slow."
             )
 
         # Run vision encoding for each request with its own KVCache.

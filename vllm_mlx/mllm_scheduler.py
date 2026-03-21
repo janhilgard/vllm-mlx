@@ -214,6 +214,10 @@ class MLLMScheduler:
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
 
+        # Memory management: periodic mx.clear_cache() to free Metal buffers
+        self._step_count = 0
+        self._clear_cache_interval = 32
+
     def _get_stop_tokens(self) -> Set[int]:
         """Get stop token IDs from tokenizer."""
         stop_tokens = set()
@@ -534,6 +538,9 @@ class MLLMScheduler:
             if request_id in self.running:
                 del self.running[request_id]
 
+            # Drain from requests dict to prevent linear memory growth
+            self.requests.pop(request_id, None)
+
             # Remove UID mappings
             if request_id in self.request_id_to_uid:
                 uid = self.request_id_to_uid[request_id]
@@ -543,6 +550,10 @@ class MLLMScheduler:
 
             # Track as finished
             self.finished_req_ids.add(request_id)
+
+        # Clear Metal buffer pool after cleanup to release memory
+        if finished_ids:
+            mx.clear_cache()
 
     def step(self) -> MLLMSchedulerOutput:
         """
@@ -588,6 +599,15 @@ class MLLMScheduler:
 
         # Clear finished tracking for next step
         self.finished_req_ids = set()
+
+        # Adaptive periodic Metal cache clearing (ported from LLM scheduler)
+        self._step_count += 1
+        active_seqs = len(self.running)
+        effective_interval = max(
+            8, self._clear_cache_interval // max(1, active_seqs // 4)
+        )
+        if self._step_count % effective_interval == 0:
+            mx.clear_cache()
 
         return output
 
@@ -806,9 +826,12 @@ class MLLMScheduler:
                 "current_memory_mb": round(vc_stats.get("memory_used_mb", 0), 2),
                 "max_memory_mb": round(vc_stats.get("max_memory_mb", 0), 2),
                 "memory_utilization": round(
-                    vc_stats.get("memory_used_mb", 0) / vc_stats.get("max_memory_mb", 1)
-                    if vc_stats.get("max_memory_mb", 0) > 0
-                    else 0,
+                    (
+                        vc_stats.get("memory_used_mb", 0)
+                        / vc_stats.get("max_memory_mb", 1)
+                        if vc_stats.get("max_memory_mb", 0) > 0
+                        else 0
+                    ),
                     4,
                 ),
                 "entry_count": vc_stats.get("entries", 0),
