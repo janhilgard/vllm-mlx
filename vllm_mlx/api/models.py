@@ -178,6 +178,10 @@ class ChatCompletionRequest(BaseModel):
     presence_penalty: float | None = None  # OpenAI style (0-2)
     # Request timeout in seconds (None = use server default)
     timeout: float | None = None
+    # SpecPrefill: per-request enable/disable (None = server decides)
+    specprefill: bool | None = None
+    # SpecPrefill: per-request keep percentage (0.0-1.0, None = use server default)
+    specprefill_keep_pct: float | None = None
 
 
 class AssistantMessage(BaseModel):

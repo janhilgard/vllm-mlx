@@ -112,6 +112,9 @@ logger = logging.getLogger(__name__)
 # Global engine instance
 _engine: BaseEngine | None = None
 _model_name: str | None = None
+_model_path: str | None = (
+    None  # Actual model path (for cache dir, not affected by --served-model-name)
+)
 _default_max_tokens: int = 32768
 _default_timeout: float = 300.0  # Default request timeout in seconds (5 minutes)
 _default_temperature: float | None = None  # Set via --default-temperature
@@ -194,11 +197,14 @@ def _save_prefix_cache_to_disk() -> None:
 
 
 def _get_cache_dir() -> str:
-    """Get cache persistence directory based on model name."""
-    # Use global _model_name which is always a string, set during load_model()
-    model_name = _model_name if _model_name else "default"
+    """Get cache persistence directory based on actual model path."""
+    # Use _model_path (actual model path) not _model_name (which may be overridden
+    # by --served-model-name). This ensures cache is shared regardless of served name.
+    model_name = (
+        _model_path if _model_path else (_model_name if _model_name else "default")
+    )
     logger.info(
-        f"[_get_cache_dir] _model_name={_model_name!r} type={type(_model_name)}"
+        f"[_get_cache_dir] _model_path={_model_path!r} type={type(_model_path)}"
     )
     # Sanitize model name for filesystem
     safe_name = str(model_name).replace("/", "--").replace("\\", "--")
@@ -388,6 +394,16 @@ def _coerce_tool_arguments(
     return arguments_json
 
 
+def _validate_model_name(request_model: str) -> None:
+    """Validate that the request model name matches the served model."""
+    if _model_name and request_model != _model_name:
+        raise HTTPException(
+            status_code=404,
+            detail=f"The model `{request_model}` does not exist. "
+            f"Available model: `{_model_name}`",
+        )
+
+
 def _parse_tool_calls_with_parser(
     output_text: str, request: ChatCompletionRequest | None = None
 ) -> tuple[str, list | None]:
@@ -524,6 +540,13 @@ def load_model(
     max_tokens: int = 32768,
     force_mllm: bool = False,
     gpu_memory_utilization: float = 0.90,
+    served_model_name: str | None = None,
+    mtp: bool = False,
+    prefill_step_size: int = 2048,
+    specprefill_enabled: bool = False,
+    specprefill_threshold: int = 8192,
+    specprefill_keep_pct: float = 0.3,
+    specprefill_draft_model: str = None,
 ):
     """
     Load a model (auto-detects MLLM vs LLM).
@@ -535,11 +558,18 @@ def load_model(
         stream_interval: Tokens to batch before streaming (batched mode only)
         max_tokens: Default max tokens for generation
         force_mllm: Force loading as MLLM even if not auto-detected
+        mtp: Enable native MTP speculative decoding (SimpleEngine only)
+        prefill_step_size: Chunk size for prompt prefill processing (default: 2048)
+        specprefill_enabled: Enable SpecPrefill (SimpleEngine only)
+        specprefill_threshold: Minimum suffix tokens to trigger SpecPrefill (default: 8192)
+        specprefill_keep_pct: Fraction of tokens to keep (default: 0.3)
+        specprefill_draft_model: Path to small draft model for SpecPrefill scoring
     """
-    global _engine, _model_name, _default_max_tokens, _tool_parser_instance
+    global _engine, _model_name, _model_path, _default_max_tokens, _tool_parser_instance
 
     _default_max_tokens = max_tokens
-    _model_name = model_name
+    _model_path = model_name
+    _model_name = served_model_name or model_name
     # Reset tool parser instance when model is reloaded (tokenizer may change)
     _tool_parser_instance = None
 
@@ -560,7 +590,16 @@ def load_model(
         logger.info(f"Model loaded (batched mode): {model_name}")
     else:
         logger.info(f"Loading model with SimpleEngine: {model_name}")
-        _engine = SimpleEngine(model_name=model_name, force_mllm=force_mllm)
+        _engine = SimpleEngine(
+            model_name=model_name,
+            force_mllm=force_mllm,
+            mtp=mtp,
+            prefill_step_size=prefill_step_size,
+            specprefill_enabled=specprefill_enabled,
+            specprefill_threshold=specprefill_threshold,
+            specprefill_keep_pct=specprefill_keep_pct,
+            specprefill_draft_model=specprefill_draft_model,
+        )
         # Start SimpleEngine synchronously (no background loop)
         # Use new_event_loop() for Python 3.10+ compatibility (get_event_loop() is deprecated)
         loop = asyncio.new_event_loop()
@@ -792,8 +831,7 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
 
         elapsed = time.perf_counter() - start_time
         logger.info(
-            f"Embeddings: {len(texts)} inputs, {prompt_tokens} tokens "
-            f"in {elapsed:.2f}s"
+            f"Embeddings: {len(texts)} inputs, {prompt_tokens} tokens in {elapsed:.2f}s"
         )
 
         # Build OpenAI-compatible response with ordered indices
@@ -814,8 +852,7 @@ async def create_embeddings(request: EmbeddingRequest) -> EmbeddingResponse:
         raise HTTPException(
             status_code=503,
             detail=(
-                "mlx-embeddings not installed. "
-                "Install with: pip install mlx-embeddings"
+                "mlx-embeddings not installed. Install with: pip install mlx-embeddings"
             ),
         )
     except HTTPException:
@@ -1225,6 +1262,7 @@ async def _wait_with_disconnect(
 )
 async def create_completion(request: CompletionRequest, raw_request: Request):
     """Create a text completion."""
+    _validate_model_name(request.model)
     engine = get_engine()
 
     # Handle single prompt or list of prompts
@@ -1303,7 +1341,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     )
 
     return CompletionResponse(
-        model=request.model,
+        model=_model_name,
         choices=choices,
         usage=Usage(
             prompt_tokens=total_prompt_tokens,
@@ -1359,6 +1397,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     }
     ```
     """
+    _validate_model_name(request.model)
     engine = get_engine()
 
     # --- Detailed request logging ---
@@ -1385,16 +1424,16 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     # For MLLM models, keep original messages with embedded images
     # (MLLM.chat() extracts images from message content internally)
     if engine.is_mllm:
-        # Convert Pydantic messages to dicts preserving full content.
-        # exclude_none=True is critical: Qwen3VL Jinja template checks
-        # 'image_url' in item — null keys would falsely trigger image tokens.
+        # Convert Pydantic messages to dicts, excluding None fields
+        # to prevent chat templates from misinterpreting key presence
+        # (e.g. image_url: null on text parts triggers Qwen3-VL crash)
         messages = []
         for msg in request.messages:
-            msg_dict = (
-                msg.model_dump(exclude_none=True)
-                if hasattr(msg, "model_dump")
-                else {k: v for k, v in dict(msg).items() if v is not None}
-            )
+            if hasattr(msg, "model_dump"):
+                msg_dict = msg.model_dump(exclude_none=True)
+            else:
+                raw = dict(msg)
+                msg_dict = {k: v for k, v in raw.items() if v is not None}
             messages.append(msg_dict)
         images, videos = [], []  # MLLM extracts these from messages
         logger.debug(f"MLLM: Processing {len(messages)} messages")
@@ -1406,6 +1445,23 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         )
 
     has_media = bool(images or videos)
+    if engine.is_mllm and not has_media:
+        # MLLM extracts media from messages directly, so images/videos are
+        # always empty. Check message content for video/image types instead.
+        for msg in request.messages:
+            content = msg.content if hasattr(msg, "content") else msg.get("content", "")
+            if isinstance(content, list):
+                for item in content:
+                    item_type = (
+                        item.type
+                        if hasattr(item, "type")
+                        else (item.get("type", "") if isinstance(item, dict) else "")
+                    )
+                    if item_type in ("image_url", "image", "video", "video_url"):
+                        has_media = True
+                        break
+            if has_media:
+                break
 
     # Handle response_format - inject system prompt if needed
     response_format = request.response_format
@@ -1439,6 +1495,12 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             chat_kwargs["video_fps"] = request.video_fps
         if request.video_max_frames:
             chat_kwargs["video_max_frames"] = request.video_max_frames
+
+    # SpecPrefill: per-request overrides
+    if request.specprefill is not None:
+        chat_kwargs["specprefill"] = request.specprefill
+    if request.specprefill_keep_pct is not None:
+        chat_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
 
     # Add tools if provided
     if request.tools:
@@ -1496,7 +1558,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     finish_reason = "tool_calls" if tool_calls else output.finish_reason
 
     return ChatCompletionResponse(
-        model=request.model,
+        model=_model_name,
         choices=[
             ChatCompletionChoice(
                 message=AssistantMessage(
@@ -1569,6 +1631,8 @@ async def create_anthropic_message(
     # Parse the raw body to handle Anthropic request format
     body = await request.json()
     anthropic_request = AnthropicRequest(**body)
+
+    _validate_model_name(anthropic_request.model)
 
     # --- Detailed request logging ---
     n_msgs = len(anthropic_request.messages)
@@ -1652,7 +1716,7 @@ async def create_anthropic_message(
 
     # Build OpenAI response to convert
     openai_response = ChatCompletionResponse(
-        model=openai_request.model,
+        model=_model_name,
         choices=[
             ChatCompletionChoice(
                 message=AssistantMessage(
@@ -1670,7 +1734,7 @@ async def create_anthropic_message(
     )
 
     # Convert to Anthropic response
-    anthropic_response = openai_to_anthropic(openai_response, anthropic_request.model)
+    anthropic_response = openai_to_anthropic(openai_response, _model_name)
     return Response(
         content=anthropic_response.model_dump_json(exclude_none=True),
         media_type="application/json",
@@ -1784,7 +1848,7 @@ async def _stream_anthropic_messages(
             "id": msg_id,
             "type": "message",
             "role": "assistant",
-            "model": anthropic_request.model,
+            "model": _model_name,
             "content": [],
             "stop_reason": None,
             "stop_sequence": None,
@@ -1915,7 +1979,7 @@ async def stream_completion(
             "id": f"cmpl-{uuid.uuid4().hex[:8]}",
             "object": "text_completion",
             "created": int(time.time()),
-            "model": request.model,
+            "model": _model_name,
             "choices": [
                 {
                     "index": 0,
@@ -1947,7 +2011,7 @@ async def stream_chat_completion(
     # First chunk with role
     first_chunk = ChatCompletionChunk(
         id=response_id,
-        model=request.model,
+        model=_model_name,
         choices=[
             ChatCompletionChunkChoice(
                 delta=ChatCompletionChunkDelta(role="assistant"),
@@ -1958,7 +2022,9 @@ async def stream_chat_completion(
 
     # Track if we need to add <think> prefix for thinking models (when no reasoning parser)
     # The template adds <think> to the prompt, so the model output starts inside the think block
-    is_thinking_model = "nemotron" in request.model.lower() and not _reasoning_parser
+    is_thinking_model = (
+        "nemotron" in (engine.model_name or "").lower() and not _reasoning_parser
+    )
     think_prefix_sent = False
 
     # Reset reasoning parser state for this stream
@@ -2115,7 +2181,7 @@ async def stream_chat_completion(
 
             chunk = ChatCompletionChunk(
                 id=response_id,
-                model=request.model,
+                model=_model_name,
                 choices=[
                     ChatCompletionChunkChoice(
                         delta=ChatCompletionChunkDelta(
@@ -2184,7 +2250,7 @@ async def stream_chat_completion(
                                     )
                         chunk = ChatCompletionChunk(
                             id=response_id,
-                            model=request.model,
+                            model=_model_name,
                             choices=[
                                 ChatCompletionChunkChoice(
                                     delta=ChatCompletionChunkDelta(
@@ -2208,7 +2274,7 @@ async def stream_chat_completion(
 
             chunk = ChatCompletionChunk(
                 id=response_id,
-                model=request.model,
+                model=_model_name,
                 choices=[
                     ChatCompletionChunkChoice(
                         delta=ChatCompletionChunkDelta(
@@ -2240,7 +2306,7 @@ async def stream_chat_completion(
             )
             tool_chunk = ChatCompletionChunk(
                 id=response_id,
-                model=request.model,
+                model=_model_name,
                 choices=[
                     ChatCompletionChunkChoice(
                         delta=ChatCompletionChunkDelta(
@@ -2276,7 +2342,7 @@ async def stream_chat_completion(
     if include_usage:
         usage_chunk = ChatCompletionChunk(
             id=response_id,
-            model=request.model,
+            model=_model_name,
             choices=[],  # Empty choices for usage-only chunk
             usage=Usage(
                 prompt_tokens=prompt_tokens,
