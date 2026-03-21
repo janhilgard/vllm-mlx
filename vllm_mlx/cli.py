@@ -713,11 +713,6 @@ Examples:
         help="Enable continuous batching for multiple concurrent users (slower for single user)",
     )
     serve_parser.add_argument(
-        "--mllm",
-        action="store_true",
-        help="Force loading as MLLM (multimodal language model)",
-    )
-    serve_parser.add_argument(
         "--gpu-memory-utilization",
         type=float,
         default=0.90,
