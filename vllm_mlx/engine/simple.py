@@ -1255,7 +1255,6 @@ class SimpleEngine(BaseEngine):
                 "memory_mb": round(cache_bytes / 1e6, 1),
             }
 
-
         # Include Metal memory stats
         try:
             import mlx.core as mx
