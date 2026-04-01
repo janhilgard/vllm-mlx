@@ -397,6 +397,7 @@ def _install_chunked_prefill(
                         caches,
                         samplers,
                         logits_processors,
+                        _prompt_checkpoints,
                     ) = zip(*batch_prompts)
                     lengths = [len(p) for p in inputs_raw]
                     max_length = max(lengths)
@@ -780,7 +781,11 @@ def _install_mtp(
                         # (both P and D) for all cache types, then
                         # re-advance with just P for a consistent state.
                         for c in prompt_cache:
-                            if hasattr(c, "is_trimmable") and c.is_trimmable():
+                            if (
+                                hasattr(c, "is_trimmable")
+                                and c.is_trimmable()
+                                and hasattr(c, "trim")
+                            ):
                                 c.trim(2)
                         for _ci, _snap in _rnn_snapshots.items():
                             prompt_cache[_ci].state = _snap
@@ -810,7 +815,11 @@ def _install_mtp(
                     else:
                         # Pure attention model: simple trim(1) is enough.
                         for c in prompt_cache:
-                            if hasattr(c, "is_trimmable") and c.is_trimmable():
+                            if (
+                                hasattr(c, "is_trimmable")
+                                and c.is_trimmable()
+                                and hasattr(c, "trim")
+                            ):
                                 c.trim(1)
                         if verify_hidden is not None:
                             _skip_state[0] = {
@@ -1717,6 +1726,7 @@ class Scheduler:
         if request is not None:
             request.set_finished(RequestStatus.FINISHED_ABORTED)
         self.finished_req_ids.add(request_id)
+        self._cleanup_detokenizer(request_id)
 
         # Flush Metal encoders after removing arrays from batch
         mx.clear_cache()
@@ -2169,6 +2179,7 @@ class Scheduler:
             aborted_ids.add(request_id)
             self.finished_req_ids.add(request_id)
         self.running.clear()
+        self._detokenizer_pool.clear()
 
         # Clear UID mappings (batch generator is gone)
         self.request_id_to_uid.clear()
@@ -2456,6 +2467,7 @@ class Scheduler:
         self.finished_req_ids.clear()
         self.request_id_to_uid.clear()
         self.uid_to_request_id.clear()
+        self._detokenizer_pool.clear()
         self._close_batch_generator()
         self._current_sampler_params = None
 

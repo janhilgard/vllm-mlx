@@ -87,10 +87,12 @@ def load_model_with_fallback(model_name: str, tokenizer_config: dict = None):
         if "TokenizersBackend" in str(e) or "Tokenizer class" in str(e):
             logger.warning(f"Standard tokenizer loading failed, using fallback: {e}")
             return _load_with_tokenizer_fallback(model_name)
-        # Fallback for models with extra weights (e.g., MTP layers, vision tower)
+        # Fallback for models with extra weights (e.g., vision tower, MTP layers).
+        # Retry with strict=False to discard extra weights.
         elif "parameters not in model" in str(e):
             logger.warning(
-                "Extra parameters found (e.g., MTP/vision weights), retrying with strict=False"
+                f"Extra parameters found (e.g., vision tower / MTP weights), "
+                f"retrying with strict=False: {e}"
             )
             # Clear traceback references to free memory from the failed first load.
             # Without this, large models (200GB+) cause OOM during retry because
