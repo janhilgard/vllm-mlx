@@ -35,7 +35,6 @@ from .mllm_batch_generator import (
     MLLMBatchRequest,
     MLLMBatchResponse,
 )
-from .mllm_cache import MLLMCacheManager
 from .multimodal_processor import MultimodalProcessor
 from .request import RequestOutput, RequestStatus, SamplingParams
 
@@ -66,6 +65,10 @@ class MLLMSchedulerConfig:
     cache_memory_mb: Optional[int] = None
     # Maximum video frames
     max_video_frames: int = 128
+    # Enable MTP speculative decoding
+    enable_mtp: bool = False
+    # Number of draft tokens for MTP
+    mtp_num_draft_tokens: int = 1
 
 
 @dataclass
@@ -259,6 +262,18 @@ class MLLMScheduler:
                 completion_batch_size=self.config.completion_batch_size,
                 prefill_step_size=self.config.prefill_step_size,
             )
+
+            # Install MTP if enabled and language model supports it
+            if self.config.enable_mtp:
+                lm = self.batch_generator.language_model
+                if hasattr(lm, "mtp") and lm.mtp is not None:
+                    from .mllm_batch_generator import install_mtp_mllm
+
+                    install_mtp_mllm(
+                        self.batch_generator,
+                        lm,
+                        num_draft_tokens=self.config.mtp_num_draft_tokens,
+                    )
 
     # ========== Sync API (step-based) ==========
 
