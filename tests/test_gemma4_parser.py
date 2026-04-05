@@ -44,7 +44,10 @@ def test_args_to_json_nested_object():
     raw = f"query:{Q}weather{Q},options:{{format:{Q}json{Q},verbose:true}}"
     result = "{" + _gemma_args_to_json(raw) + "}"
     parsed = json.loads(result)
-    assert parsed == {"query": "weather", "options": {"format": "json", "verbose": True}}
+    assert parsed == {
+        "query": "weather",
+        "options": {"format": "json", "verbose": True},
+    }
 
 
 def test_args_to_json_array():
@@ -55,7 +58,7 @@ def test_args_to_json_array():
 
 
 def test_args_to_json_string_with_special_chars():
-    raw = f'message:{Q}Hello, how are you? I\'m fine!{Q}'
+    raw = f"message:{Q}Hello, how are you? I'm fine!{Q}"
     result = "{" + _gemma_args_to_json(raw) + "}"
     parsed = json.loads(result)
     assert parsed == {"message": "Hello, how are you? I'm fine!"}

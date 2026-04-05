@@ -196,7 +196,9 @@ def inject_mtp_support(model: Any, model_path, config: dict) -> bool:
     bits = quant_config.get("bits", 4) if quant_config else 4
     group_size = quant_config.get("group_size", 64) if quant_config else 64
 
-    logger.info(f"[MTP inject] Loading weights from {mtp_file.name} (BF16, no quantization)")
+    logger.info(
+        f"[MTP inject] Loading weights from {mtp_file.name} (BF16, no quantization)"
+    )
     raw = mx.load(str(mtp_file))
     raw_mtp = {
         k.removeprefix("mtp."): v for k, v in raw.items() if k.startswith("mtp.")
