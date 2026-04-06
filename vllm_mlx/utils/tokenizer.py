@@ -155,8 +155,23 @@ def _load_strict_false(model_name: str, tokenizer_config: dict = None):
 
 def _try_inject_mtp(model, model_path, config):
     """Inject MTP support if model has MTP config + weights."""
+    # Qwen3-Next: flat num_nextn_predict_layers
     if config.get("num_nextn_predict_layers", 0) > 0:
-        from ..patches.qwen3_next_mtp import inject_mtp_support
+        # Detect Qwen3.5 vs Qwen3-Next by checking text_config or model_type
+        text_config = config.get("text_config", config)
+        model_type = text_config.get("model_type", config.get("model_type", ""))
+        if "qwen3_5" in model_type:
+            from ..patches.qwen3_5_mtp import inject_mtp_support
+        else:
+            from ..patches.qwen3_next_mtp import inject_mtp_support
+        inject_mtp_support(model, model_path, config)
+        return
+
+    # Qwen3.5: mtp_num_hidden_layers in text_config
+    text_config = config.get("text_config", config)
+    num_mtp = text_config.get("mtp_num_hidden_layers", 0)
+    if num_mtp > 0:
+        from ..patches.qwen3_5_mtp import inject_mtp_support
 
         inject_mtp_support(model, model_path, config)
 
@@ -173,13 +188,21 @@ def _try_inject_mtp_post_load(model, model_name):
         return
     with open(config_path) as f:
         config = json.load(f)
-    # Also check text_config for nested configs
+    # Check for MTP in flat config and nested text_config
+    text_config = config.get("text_config", {})
     num_mtp = config.get("num_nextn_predict_layers", 0)
     if num_mtp == 0:
-        text_config = config.get("text_config", {})
         num_mtp = text_config.get("num_nextn_predict_layers", 0)
-    if num_mtp > 0 and getattr(model, "mtp", None) is None:
-        mtp_file = Path(model_path) / "model-mtp.safetensors"
+    if num_mtp == 0:
+        num_mtp = text_config.get("mtp_num_hidden_layers", 0)
+    # Also check mtp attribute on language_model for VLM wrappers
+    check_model = model
+    if hasattr(model, "language_model"):
+        check_model = model.language_model
+    if num_mtp > 0 and getattr(check_model, "mtp", None) is None:
+        mtp_file = Path(model_path) / "mtp" / "weights.safetensors"
+        if not mtp_file.exists():
+            mtp_file = Path(model_path) / "model-mtp.safetensors"
         if mtp_file.exists():
             logger.info(
                 f"[MTP] Found MTP config (layers={num_mtp}) and weights, injecting..."
@@ -188,7 +211,7 @@ def _try_inject_mtp_post_load(model, model_name):
         else:
             logger.info(
                 f"[MTP] Config has num_nextn_predict_layers={num_mtp} "
-                "but model-mtp.safetensors not found, skipping MTP."
+                "but MTP weights not found, skipping MTP."
             )
 
 

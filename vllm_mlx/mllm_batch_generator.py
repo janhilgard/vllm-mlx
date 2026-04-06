@@ -24,6 +24,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig, _trim_cache_offset
 from .multimodal_processor import MultimodalProcessor
 from .vision_embedding_cache import VisionEmbeddingCache
 
@@ -47,6 +48,7 @@ class MLLMBatchRequest:
     max_tokens: int = 256
     temperature: float = 0.7
     top_p: float = 0.9
+    repetition_penalty: float = 1.0
 
     # Processed inputs (set after vision preprocessing)
     input_ids: Optional[mx.array] = None
@@ -54,6 +56,9 @@ class MLLMBatchRequest:
     attention_mask: Optional[mx.array] = None
     image_grid_thw: Optional[mx.array] = None
     extra_kwargs: Dict[str, Any] = field(default_factory=dict)
+
+    # Text-only flag (no images/videos — eligible for prefix cache)
+    is_text_only: bool = False
 
     # Generation state
     num_tokens: int = 0  # Tokens generated so far
@@ -98,6 +103,7 @@ class MLLMBatch:
     num_tokens: List[int]  # Tokens generated per request
     cache: List[Any]  # BatchKVCache for language model
     requests: List[MLLMBatchRequest]  # Full request data
+    logits_processors: Optional[List[Optional[List[Callable]]]] = None
 
     def __len__(self) -> int:
         return len(self.uids)
@@ -115,6 +121,8 @@ class MLLMBatch:
         self.max_tokens = [self.max_tokens[k] for k in keep_idx]
         self.num_tokens = [self.num_tokens[k] for k in keep_idx]
         self.requests = [self.requests[k] for k in keep_idx]
+        if self.logits_processors is not None:
+            self.logits_processors = [self.logits_processors[k] for k in keep_idx]
 
         keep_idx_array = mx.array(keep_idx, mx.int32)
         self.y = self.y[keep_idx_array]
@@ -138,6 +146,14 @@ class MLLMBatch:
         self.num_tokens.extend(other.num_tokens)
         self.max_tokens.extend(other.max_tokens)
         self.requests.extend(other.requests)
+
+        # Extend logits_processors
+        if self.logits_processors is not None or other.logits_processors is not None:
+            # At this point self.uids already includes other.uids from extend above
+            self_len = len(self.uids) - len(other.uids)
+            self_lp = self.logits_processors or [None] * self_len
+            other_lp = other.logits_processors or [None] * len(other.uids)
+            self.logits_processors = list(self_lp) + list(other_lp)
 
         # Extend cache - handle both BatchKVCache (.keys/.values) and
         # ArraysCache (.cache list) from hybrid models like Qwen3.5
@@ -292,6 +308,7 @@ class MLLMBatchGenerator:
         prefill_step_size: int = 1024,
         enable_vision_cache: bool = True,
         vision_cache_size: int = 100,
+        prefix_cache_config: Optional[MemoryCacheConfig] = None,
     ):
         """
         Initialize MLLM batch generator.
@@ -308,6 +325,7 @@ class MLLMBatchGenerator:
             prefill_step_size: Tokens to process per prefill step
             enable_vision_cache: Enable vision embedding caching
             vision_cache_size: Max entries in vision cache
+            prefix_cache_config: Config for KV prefix cache (text-only requests)
         """
         self.model = model
         self.processor = processor
@@ -363,6 +381,15 @@ class MLLMBatchGenerator:
             logger.info(
                 f"MLLMBatchGenerator: Vision cache enabled (size={vision_cache_size})"
             )
+
+        # KV prefix cache for text-only requests
+        self.prefix_cache: Optional[MemoryAwarePrefixCache] = None
+        if prefix_cache_config is not None:
+            self.prefix_cache = MemoryAwarePrefixCache(
+                model=self.language_model,
+                config=prefix_cache_config,
+            )
+            logger.info("MLLMBatchGenerator: KV prefix cache enabled")
 
         # Generation stream
         if MLLMBatchGenerator._stream is None:
@@ -558,6 +585,9 @@ class MLLMBatchGenerator:
         self._stats.num_images_processed += len(all_images)
         self._stats.vision_encoding_time += processing_time
 
+        # Mark text-only requests (eligible for prefix cache)
+        request.is_text_only = not bool(all_images)
+
         logger.debug(
             f"Preprocessed request {request.request_id}: "
             f"{len(all_images)} images, {request.input_ids.size if request.input_ids is not None else 0} tokens "
@@ -675,48 +705,129 @@ class MLLMBatchGenerator:
         # Vision encoding cannot be batched because each request may have
         # different images/pixel values. We pass a per-request KVCache to
         # the VLM so the language model writes its KV state directly into it.
+        #
+        # For text-only requests, we check the prefix cache first. If there's
+        # a hit, we skip the full VLM forward and run only the language model
+        # on the remaining (uncached) tokens.
         first_tokens = []
         all_logprobs = []
         per_request_caches = []
 
         for req in requests:
-            # Create a fresh KVCache for this request's language model prefill
-            request_cache = make_prompt_cache(self.language_model)
+            # Try prefix cache for text-only requests
+            cached_kv = None
+            remaining_ids = None
+            if (
+                self.prefix_cache is not None
+                and req.is_text_only
+                and req.input_ids is not None
+            ):
+                input_ids_list = req.input_ids.reshape(-1).tolist()
+                cached_kv, remaining_ids = self.prefix_cache.fetch(input_ids_list)
 
-            with mx.stream(MLLMBatchGenerator._stream):
-                # Run VLM forward pass — cache= flows through to language_model
-                logits = self._run_vision_encoding(req, cache=request_cache)
+            if cached_kv is not None and remaining_ids:
+                # Prefix/LCP match — run language model on remaining tokens
+                request_cache = cached_kv
+                remaining = mx.array(remaining_ids)[None, :]
 
-                # Extract last token logits and sample
-                last_logits = logits[:, -1, :]
-                logprobs = last_logits - mx.logsumexp(
-                    last_logits, axis=-1, keepdims=True
+                with mx.stream(MLLMBatchGenerator._stream):
+                    logits = self.language_model(remaining, cache=request_cache)
+                    if hasattr(logits, "logits"):
+                        logits = logits.logits
+
+                    last_logits = logits[:, -1, :]
+                    logprobs = last_logits - mx.logsumexp(
+                        last_logits, axis=-1, keepdims=True
+                    )
+                    sampled = self.sampler(logprobs)
+                    mx.eval(sampled, logprobs)
+
+                    first_tokens.append(sampled.item())
+                    all_logprobs.append(logprobs.squeeze(0))
+
+                per_request_caches.append(request_cache)
+                logger.debug(
+                    f"Prefix cache hit for {req.request_id}: "
+                    f"cached={len(input_ids_list) - len(remaining_ids)}, "
+                    f"remaining={len(remaining_ids)}"
                 )
-                sampled = self.sampler(logprobs)
 
-                mx.eval(sampled, logprobs)
+            elif cached_kv is not None and not remaining_ids:
+                # Exact/supersequence match — cache has all tokens,
+                # but we still need logits for the last token.
+                # fetch() with trim-by-1 store always returns remaining=[last_token].
+                # If we get here (empty remaining), re-run on last token.
+                request_cache = cached_kv
+                last_token = req.input_ids[:, -1:]
 
-                first_tokens.append(sampled.item())
-                all_logprobs.append(logprobs.squeeze(0))
+                with mx.stream(MLLMBatchGenerator._stream):
+                    logits = self.language_model(last_token, cache=request_cache)
+                    if hasattr(logits, "logits"):
+                        logits = logits.logits
 
-            per_request_caches.append(request_cache)
+                    last_logits = logits[:, -1, :]
+                    logprobs = last_logits - mx.logsumexp(
+                        last_logits, axis=-1, keepdims=True
+                    )
+                    sampled = self.sampler(logprobs)
+                    mx.eval(sampled, logprobs)
+
+                    first_tokens.append(sampled.item())
+                    all_logprobs.append(logprobs.squeeze(0))
+
+                per_request_caches.append(request_cache)
+                logger.debug(
+                    f"Prefix cache exact hit for {req.request_id}: "
+                    f"all {len(input_ids_list)} tokens cached"
+                )
+
+            else:
+                # Cache miss — full VLM forward pass
+                request_cache = make_prompt_cache(self.language_model)
+
+                with mx.stream(MLLMBatchGenerator._stream):
+                    # Run VLM forward pass — cache= flows through to language_model
+                    logits = self._run_vision_encoding(req, cache=request_cache)
+
+                    # Extract last token logits and sample
+                    last_logits = logits[:, -1, :]
+                    logprobs = last_logits - mx.logsumexp(
+                        last_logits, axis=-1, keepdims=True
+                    )
+                    sampled = self.sampler(logprobs)
+
+                    mx.eval(sampled, logprobs)
+
+                    first_tokens.append(sampled.item())
+                    all_logprobs.append(logprobs.squeeze(0))
+
+                per_request_caches.append(request_cache)
 
         # Merge per-request caches into batched caches.
         # Both KVCache.merge() and ArraysCache.merge() produce batch-aware
         # caches that support filter/extend/extract for continuous batching.
         #
-        # Fix: RotatingKVCache._idx tracks total tokens processed, but when
-        # the prompt exceeds max_size the actual stored KV pairs are capped
-        # at max_size.  BatchRotatingKVCache.merge() uses _idx to slice into
-        # the keys/values buffer, causing a shape mismatch.  Clamp _idx to
-        # the real buffer length before merging.
+        # Fix: RotatingKVCache._update_concat does NOT trim on first call —
+        # if prompt length > max_size, the buffer grows beyond max_size.
+        # BatchRotatingKVCache.merge() then hits a shape mismatch when
+        # copying via _temporal_order (full buffer) into a max_size slice.
+        # Trim buffer to max_size before merging.
         from mlx_lm.models.cache import RotatingKVCache
 
         for rc in per_request_caches:
             for layer_cache in rc:
                 if isinstance(layer_cache, RotatingKVCache):
-                    if layer_cache._idx > layer_cache.max_size:
-                        layer_cache._idx = layer_cache.max_size
+                    if layer_cache.keys is not None:
+                        buf_len = layer_cache.keys.shape[2]
+                        if buf_len > layer_cache.max_size:
+                            trim_size = buf_len - layer_cache.max_size
+                            layer_cache.keys = layer_cache._trim(
+                                trim_size, layer_cache.keys
+                            )
+                            layer_cache.values = layer_cache._trim(
+                                trim_size, layer_cache.values
+                            )
+                            layer_cache._idx = layer_cache.max_size
 
         try:
             batch_cache = [
@@ -736,6 +847,23 @@ class MLLMBatchGenerator:
         # Create initial y (first generated tokens)
         y = mx.array(first_tokens)
 
+        # Build per-request logits processors from repetition_penalty
+        from mlx_lm.sample_utils import make_logits_processors
+
+        batch_logits_processors = []
+        has_any = False
+        for req in requests:
+            if req.repetition_penalty and req.repetition_penalty != 1.0:
+                lp = make_logits_processors(repetition_penalty=req.repetition_penalty)
+                batch_logits_processors.append(lp)
+                has_any = True
+                logger.info(
+                    f"[rep_penalty] request={req.request_id[:12]} "
+                    f"penalty={req.repetition_penalty}"
+                )
+            else:
+                batch_logits_processors.append(None)
+
         self._stats.prompt_time += time.perf_counter() - tic
 
         return MLLMBatch(
@@ -747,10 +875,15 @@ class MLLMBatchGenerator:
             num_tokens=[0] * len(requests),
             cache=batch_cache,
             requests=requests,
+            logits_processors=batch_logits_processors if has_any else None,
         )
 
     def _step(
-        self, input_tokens: mx.array, cache: List[Any]
+        self,
+        input_tokens: mx.array,
+        cache: List[Any],
+        logits_processors: Optional[List[Optional[List[Callable]]]] = None,
+        output_tokens: Optional[List[List[int]]] = None,
     ) -> Tuple[mx.array, List[mx.array]]:
         """
         Run one generation step through the language model.
@@ -758,6 +891,8 @@ class MLLMBatchGenerator:
         Args:
             input_tokens: Input tokens [batch_size, 1] or [batch_size]
             cache: BatchKVCache for the language model
+            logits_processors: Per-request logits processors (e.g. repetition penalty)
+            output_tokens: Per-request generated tokens so far (needed by processors)
 
         Returns:
             Tuple of (sampled tokens, logprobs list)
@@ -776,6 +911,19 @@ class MLLMBatchGenerator:
             logits = output
 
         logits = logits[:, -1, :]
+
+        # Apply per-request logits processors (repetition penalty etc.)
+        if logits_processors and output_tokens and any(logits_processors):
+            processed_logits = []
+            for e in range(logits.shape[0]):
+                sample_logits = logits[e : e + 1]
+                if logits_processors[e]:
+                    for processor in logits_processors[e]:
+                        sample_logits = processor(
+                            mx.array(output_tokens[e]), sample_logits
+                        )
+                processed_logits.append(sample_logits)
+            logits = mx.concatenate(processed_logits, axis=0)
 
         # Sample
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
@@ -808,10 +956,29 @@ class MLLMBatchGenerator:
                 self.active_batch = None
                 return []
 
-            new_batch = self._process_prompts(requests)
-            self.unprocessed_requests = self.unprocessed_requests[len(requests) :]
-            self.active_batch = new_batch
-            prompt_processing = True
+            try:
+                new_batch = self._process_prompts(requests)
+                self.unprocessed_requests = self.unprocessed_requests[len(requests) :]
+                self.active_batch = new_batch
+                prompt_processing = True
+            except Exception as e:
+                logger.error(
+                    f"Failed to process batch of {len(requests)} prompts: "
+                    f"{type(e).__name__}: {e}",
+                    exc_info=True,
+                )
+                # Remove failed requests to avoid infinite retry loop
+                self.unprocessed_requests = self.unprocessed_requests[len(requests) :]
+                for req in requests:
+                    self._pending_error_responses.append(
+                        MLLMBatchResponse(
+                            uid=req.uid,
+                            request_id=req.request_id,
+                            token=0,
+                            logprobs=mx.zeros(1),
+                            finish_reason="error",
+                        )
+                    )
 
         # Collect any pending error responses (from failed preprocessing)
         error_responses = []
@@ -825,7 +992,14 @@ class MLLMBatchGenerator:
             return error_responses
 
         y, logprobs = batch.y, batch.logprobs
-        batch.y, batch.logprobs = self._step(y[:, None], batch.cache)
+        output_tokens = (
+            [req.output_tokens for req in batch.requests]
+            if batch.logits_processors
+            else None
+        )
+        batch.y, batch.logprobs = self._step(
+            y[:, None], batch.cache, batch.logits_processors, output_tokens
+        )
         mx.async_eval(batch.y, batch.logprobs)
 
         y = y.tolist()
@@ -883,6 +1057,9 @@ class MLLMBatchGenerator:
                 )
             )
 
+        # Store caches for finished text-only requests BEFORE filtering
+        self._maybe_store_prefix_cache(batch, end_idx)
+
         # Remove finished requests from batch
         if end_idx:
             if keep_idx:
@@ -913,9 +1090,48 @@ class MLLMBatchGenerator:
         self._stats.peak_memory = mx.get_peak_memory() / 1e9
         return self._stats
 
+    def _maybe_store_prefix_cache(
+        self, batch: MLLMBatch, end_indices: List[int]
+    ) -> None:
+        """Store KV caches for finished text-only requests into prefix cache.
+
+        Must be called BEFORE batch.filter() so that indices are still valid.
+        """
+        if self.prefix_cache is None or not end_indices:
+            return
+        for i in end_indices:
+            req = batch.requests[i]
+            if req.is_text_only and req.input_ids is not None:
+                try:
+                    extracted = batch.extract_cache(i)
+                    input_ids_list = req.input_ids.reshape(-1).tolist()
+                    # Store prompt-only KV (trim output tokens + 1 so next
+                    # fetch returns remaining=[last_prompt_token] at minimum)
+                    output_count = batch.num_tokens[i]
+                    prompt_cache = _trim_cache_offset(extracted, output_count + 1)
+                    self.prefix_cache.store(input_ids_list, prompt_cache)
+                except Exception as e:
+                    logger.warning(f"[prefix_store] FAILED: {type(e).__name__}: {e}")
+
     def get_vision_cache_stats(self) -> Dict[str, Any]:
         """Get vision cache statistics."""
         return self.vision_cache.get_stats()
+
+    def get_prefix_cache_stats(self) -> Dict[str, Any]:
+        """Get KV prefix cache statistics."""
+        if self.prefix_cache is not None:
+            return self.prefix_cache.get_stats()
+        return {
+            "hits": 0,
+            "misses": 0,
+            "hit_rate": 0.0,
+            "evictions": 0,
+            "tokens_saved": 0,
+            "current_memory_mb": 0.0,
+            "max_memory_mb": 0.0,
+            "memory_utilization": 0.0,
+            "entry_count": 0,
+        }
 
     def has_pending(self) -> bool:
         """Check if there are pending or active requests."""
@@ -956,7 +1172,10 @@ def install_mtp_mllm(
     _mtp_stats = {"accepted": 0, "rejected": 0, "errors": 0}
 
     def _mtp_step(
-        input_tokens: mx.array, cache: List[Any]
+        input_tokens: mx.array,
+        cache: List[Any],
+        logits_processors: Optional[List[Optional[List[Callable]]]] = None,
+        output_tokens: Optional[List[List[int]]] = None,
     ) -> Tuple[mx.array, List[mx.array]]:
         """Extended _step with MTP always-advance strategy."""
         batch_size = input_tokens.shape[0]
@@ -970,7 +1189,7 @@ def install_mtp_mllm(
             or len(batch_gen.active_batch) > 1
         ):
             _skip_state[0] = None
-            return _orig_step(input_tokens, cache)
+            return _orig_step(input_tokens, cache, logits_processors, output_tokens)
 
         # Check skip state
         skip = _skip_state[0]
@@ -988,8 +1207,21 @@ def install_mtp_mllm(
             if isinstance(model_output, tuple):
                 logits, hidden_states = model_output
             else:
-                return _orig_step(input_tokens, cache)
+                return _orig_step(input_tokens, cache, logits_processors, output_tokens)
             logits = logits[:, -1, :]
+
+        # Apply logits processors before sampling
+        if logits_processors and output_tokens and any(logits_processors):
+            processed_logits = []
+            for e in range(batch_size):
+                sample_logits = logits[e : e + 1]
+                if logits_processors[e]:
+                    for processor in logits_processors[e]:
+                        sample_logits = processor(
+                            mx.array(output_tokens[e]), sample_logits
+                        )
+                processed_logits.append(sample_logits)
+            logits = mx.concatenate(processed_logits, axis=0)
 
         # Sample primary
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
@@ -1207,8 +1439,15 @@ def install_mtp_mllm(
                         )
                     )
 
-        # Remove sequences that finished due to draft tokens
+        # Store prefix caches for draft-ended sequences BEFORE filtering
         if draft_end_uids and batch_gen.active_batch is not None:
+            end_indices = [
+                e
+                for e, u in enumerate(batch_gen.active_batch.uids)
+                if u in draft_end_uids
+            ]
+            batch_gen._maybe_store_prefix_cache(batch_gen.active_batch, end_indices)
+
             keep = [
                 e
                 for e, u in enumerate(batch_gen.active_batch.uids)

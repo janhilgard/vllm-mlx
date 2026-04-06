@@ -69,6 +69,10 @@ class MLLMSchedulerConfig:
     enable_mtp: bool = False
     # Number of draft tokens for MTP
     mtp_num_draft_tokens: int = 1
+    # Enable KV prefix cache for text-only requests
+    enable_prefix_cache: bool = True
+    # Memory limit for prefix cache (None = auto-detect)
+    prefix_cache_memory_mb: Optional[int] = None
 
 
 @dataclass
@@ -224,7 +228,7 @@ class MLLMScheduler:
         self._clear_cache_interval = 32
 
     def _get_stop_tokens(self) -> Set[int]:
-        """Get stop token IDs from tokenizer."""
+        """Get stop token IDs from tokenizer and generation_config.json."""
         stop_tokens = set()
         tokenizer = (
             self.processor.tokenizer
@@ -244,6 +248,25 @@ class MLLMScheduler:
             else:
                 stop_tokens.add(tokenizer.eos_token_ids)
 
+        # Also read generation_config.json which may have additional EOS tokens
+        # (e.g., Gemma 4 has <turn|>=106, <|tool_response>=50 as EOS)
+        model_path = getattr(tokenizer, "name_or_path", None)
+        if model_path:
+            import json
+            from pathlib import Path
+
+            gc_path = Path(model_path) / "generation_config.json"
+            if gc_path.exists():
+                try:
+                    gc = json.loads(gc_path.read_text())
+                    gc_eos = gc.get("eos_token_id")
+                    if isinstance(gc_eos, list):
+                        stop_tokens.update(gc_eos)
+                    elif gc_eos is not None:
+                        stop_tokens.add(gc_eos)
+                except Exception:
+                    pass
+
         return stop_tokens
 
     def _ensure_batch_generator(self) -> None:
@@ -251,8 +274,17 @@ class MLLMScheduler:
         if self.batch_generator is None:
             from mlx_lm.sample_utils import make_sampler
 
+            from .memory_cache import MemoryCacheConfig
+
             # Default sampler (can be overridden per-request in future)
             sampler = make_sampler(temp=0.7, top_p=0.9)
+
+            # Configure KV prefix cache for text-only requests
+            prefix_cache_config = None
+            if self.config.enable_prefix_cache:
+                prefix_cache_config = MemoryCacheConfig(
+                    max_memory_mb=self.config.prefix_cache_memory_mb,
+                )
 
             self.batch_generator = MLLMBatchGenerator(
                 model=self.model,
@@ -264,6 +296,7 @@ class MLLMScheduler:
                 prefill_batch_size=self.config.prefill_batch_size,
                 completion_batch_size=self.config.completion_batch_size,
                 prefill_step_size=self.config.prefill_step_size,
+                prefix_cache_config=prefix_cache_config,
             )
 
             # Install MTP if enabled and language model supports it
@@ -314,6 +347,7 @@ class MLLMScheduler:
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
+            repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
         )
 
         request = MLLMRequest(
@@ -420,6 +454,7 @@ class MLLMScheduler:
                 max_tokens=request.sampling_params.max_tokens,
                 temperature=request.sampling_params.temperature,
                 top_p=request.sampling_params.top_p,
+                repetition_penalty=request.sampling_params.repetition_penalty,
             )
             batch_requests.append(batch_req)
 
@@ -931,38 +966,22 @@ class MLLMScheduler:
             active_gb = 0
             cache_gb = 0
 
-        # Build KV cache stats for /v1/status and monitoring UI.
-        # Combine Metal KV cache memory with vision embedding cache hits.
-        max_mb = float(self.config.cache_memory_mb or 0)
-        current_mb = round(cache_gb * 1024, 2)
-        vec_stats = (
-            self.batch_generator.get_vision_cache_stats()
-            if self.batch_generator
-            else {}
-        )
-        hits = vec_stats.get("pixel_cache_hits", 0) + vec_stats.get(
-            "encoding_cache_hits", 0
-        )
-        misses = vec_stats.get("pixel_cache_misses", 0) + vec_stats.get(
-            "encoding_cache_misses", 0
-        )
-        total = hits + misses
-        entries = (
-            vec_stats.get("pixel_cache_size", 0)
-            + vec_stats.get("pixel_only_cache_size", 0)
-            + vec_stats.get("encoding_cache_size", 0)
-        )
-        stats["memory_aware_cache"] = {
-            "hits": hits,
-            "misses": misses,
-            "hit_rate": round(hits / total, 4) if total > 0 else 0.0,
-            "evictions": 0,
-            "tokens_saved": 0,
-            "current_memory_mb": current_mb,
-            "max_memory_mb": max_mb,
-            "memory_utilization": round(current_mb / max_mb, 4) if max_mb > 0 else 0.0,
-            "entry_count": entries,
-        }
+        # KV prefix cache stats for /v1/status and monitoring UI.
+        if self.batch_generator is not None:
+            prefix_stats = self.batch_generator.get_prefix_cache_stats()
+        else:
+            prefix_stats = {
+                "hits": 0,
+                "misses": 0,
+                "hit_rate": 0.0,
+                "evictions": 0,
+                "tokens_saved": 0,
+                "current_memory_mb": 0.0,
+                "max_memory_mb": 0.0,
+                "memory_utilization": 0.0,
+                "entry_count": 0,
+            }
+        stats["memory_aware_cache"] = prefix_stats
 
         return stats
 
