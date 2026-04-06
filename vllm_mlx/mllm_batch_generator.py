@@ -327,10 +327,12 @@ class MLLMBatchGenerator:
                 "MLLMBatchGenerator: Model does not have language_model, using model directly"
             )
 
-        # Patch Qwen3.5 attention for BatchKVCache compatibility
+        # Patch attention for BatchKVCache compatibility
         from .patches.qwen3_5_mllm import patch_qwen35_attention_for_batching
+        from .patches.gemma4_mllm import patch_gemma4_attention_for_batching
 
         patch_qwen35_attention_for_batching()
+        patch_gemma4_attention_for_batching()
 
         self.max_tokens = max_tokens
         self.stop_tokens = stop_tokens or set()
@@ -702,6 +704,20 @@ class MLLMBatchGenerator:
         # Merge per-request caches into batched caches.
         # Both KVCache.merge() and ArraysCache.merge() produce batch-aware
         # caches that support filter/extend/extract for continuous batching.
+        #
+        # Fix: RotatingKVCache._idx tracks total tokens processed, but when
+        # the prompt exceeds max_size the actual stored KV pairs are capped
+        # at max_size.  BatchRotatingKVCache.merge() uses _idx to slice into
+        # the keys/values buffer, causing a shape mismatch.  Clamp _idx to
+        # the real buffer length before merging.
+        from mlx_lm.models.cache import RotatingKVCache
+
+        for rc in per_request_caches:
+            for layer_cache in rc:
+                if isinstance(layer_cache, RotatingKVCache):
+                    if layer_cache._idx > layer_cache.max_size:
+                        layer_cache._idx = layer_cache.max_size
+
         try:
             batch_cache = [
                 per_request_caches[0][layer_idx].merge(
@@ -904,3 +920,312 @@ class MLLMBatchGenerator:
     def has_pending(self) -> bool:
         """Check if there are pending or active requests."""
         return bool(self.unprocessed_requests or self.active_batch)
+
+
+def install_mtp_mllm(
+    batch_gen: "MLLMBatchGenerator",
+    language_model: Any,
+    num_draft_tokens: int = 1,
+) -> None:
+    """Install MTP (Multi-Token Prediction) on an MLLMBatchGenerator.
+
+    Adapts the always-advance MTP strategy from scheduler._install_mtp
+    for the MLLM batched generation path. Handles hybrid model caches
+    (BatchKVCache for attention + ArraysCache for recurrent layers).
+
+    Flow per generation step:
+    1. Use skip_state logits/hidden OR run model forward -> sample primary
+    2. MTP head drafts one token
+    3. Verify [primary, draft] in one model call (always advances cache)
+    4. Accept: skip_state from pos 1, defer draft for next step emission
+       Reject: trim KV by 2 + restore RNN state + re-advance with primary
+    5. Draft is emitted in the NEXT generation step after primary
+    """
+    from .scheduler import make_sampler
+
+    _orig_step = batch_gen._step
+    _draft_sampler = make_sampler(temp=0.0)
+
+    # Skip state: stored logits + hidden from verify pass
+    _skip_state: list = [None]
+
+    # Deferred drafts keyed by UID
+    _deferred_drafts: Dict[int, dict] = {}
+
+    # MTP stats
+    _mtp_stats = {"accepted": 0, "rejected": 0, "errors": 0}
+
+    def _mtp_step(
+        input_tokens: mx.array, cache: List[Any]
+    ) -> Tuple[mx.array, List[mx.array]]:
+        """Extended _step with MTP always-advance strategy."""
+        batch_size = input_tokens.shape[0]
+
+        # Prefill guard: skip MTP for multi-token input or when no active batch
+        # Also skip MTP when batch has multiple active requests (MTP overhead
+        # hurts aggregate throughput in concurrent scenarios)
+        if (
+            input_tokens.shape[1] > 1
+            or batch_gen.active_batch is None
+            or len(batch_gen.active_batch) > 1
+        ):
+            _skip_state[0] = None
+            return _orig_step(input_tokens, cache)
+
+        # Check skip state
+        skip = _skip_state[0]
+        if skip is not None and skip["logits"].shape[0] != batch_size:
+            skip = None
+            _skip_state[0] = None
+
+        if skip is not None:
+            logits = skip["logits"]
+            hidden_states = skip["hidden"]
+            _skip_state[0] = None
+        else:
+            # Normal forward with return_hidden
+            model_output = language_model(input_tokens, cache=cache, return_hidden=True)
+            if isinstance(model_output, tuple):
+                logits, hidden_states = model_output
+            else:
+                return _orig_step(input_tokens, cache)
+            logits = logits[:, -1, :]
+
+        # Sample primary
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        primary_tokens = batch_gen.sampler(logprobs)
+
+        current_uids = list(batch_gen.active_batch.uids)
+
+        # MTP draft + always-advance verify
+        try:
+            draft_logits = language_model.mtp_forward(
+                hidden_states[:, -1:, :],
+                primary_tokens[:, None],
+                mtp_cache=None,
+            )
+            draft_logits = draft_logits[:, -1, :]
+            draft_logprobs = draft_logits - mx.logsumexp(
+                draft_logits, axis=-1, keepdims=True
+            )
+            draft_tokens = _draft_sampler(draft_logprobs)
+
+            # Snapshot RNN state for hybrid models
+            _rnn_snapshots = {}
+            for _ci, _c in enumerate(cache):
+                if not (hasattr(_c, "is_trimmable") and _c.is_trimmable()):
+                    if hasattr(_c, "state"):
+                        _rnn_snapshots[_ci] = [
+                            mx.array(s) if s is not None else None for s in _c.state
+                        ]
+
+            # Verify [primary, draft]
+            verify_input = mx.concatenate(
+                [primary_tokens[:, None], draft_tokens[:, None]], axis=1
+            )
+            verify_output = language_model(
+                verify_input, cache=cache, return_hidden=True
+            )
+            if isinstance(verify_output, tuple):
+                verify_logits, verify_hidden = verify_output
+            else:
+                verify_logits = verify_output
+                verify_hidden = None
+
+            # Verified mode: check if draft matches verify prediction
+            verify_pred = mx.argmax(verify_logits[:, 0, :], axis=-1)
+            mx.eval(verify_pred, draft_tokens)
+            pred_list = verify_pred.tolist()
+            draft_list = draft_tokens.tolist()
+            all_accepted = pred_list == draft_list
+
+            if all_accepted and verify_hidden is not None:
+                # ACCEPT
+                _skip_state[0] = {
+                    "logits": verify_logits[:, 1, :],
+                    "hidden": verify_hidden[:, -1:, :],
+                }
+                mx.async_eval(_skip_state[0]["logits"], _skip_state[0]["hidden"])
+                verify_lp = verify_logits[:, 0, :] - mx.logsumexp(
+                    verify_logits[:, 0, :], axis=-1, keepdims=True
+                )
+                for e in range(batch_size):
+                    uid = current_uids[e]
+                    _deferred_drafts[uid] = {
+                        "token": draft_list[e],
+                        "logprobs": verify_lp[e],
+                    }
+                _mtp_stats["accepted"] += 1
+
+            else:
+                # REJECT
+                if _rnn_snapshots:
+                    # Hybrid model: undo entire verify, re-advance with primary
+                    for c in cache:
+                        if (
+                            hasattr(c, "is_trimmable")
+                            and c.is_trimmable()
+                            and hasattr(c, "trim")
+                        ):
+                            c.trim(2)
+                    for _ci, _snap in _rnn_snapshots.items():
+                        cache[_ci].state = _snap
+                    rerun_out = language_model(
+                        primary_tokens[:, None],
+                        cache=cache,
+                        return_hidden=True,
+                    )
+                    if isinstance(rerun_out, tuple):
+                        rerun_logits, rerun_hidden = rerun_out
+                    else:
+                        rerun_logits = rerun_out
+                        rerun_hidden = None
+                    if rerun_hidden is not None:
+                        _skip_state[0] = {
+                            "logits": rerun_logits[:, -1, :],
+                            "hidden": rerun_hidden[:, -1:, :],
+                        }
+                        mx.async_eval(
+                            _skip_state[0]["logits"],
+                            _skip_state[0]["hidden"],
+                        )
+                    else:
+                        _skip_state[0] = None
+                else:
+                    # Pure attention model: simple trim
+                    for c in cache:
+                        if (
+                            hasattr(c, "is_trimmable")
+                            and c.is_trimmable()
+                            and hasattr(c, "trim")
+                        ):
+                            c.trim(1)
+                    if verify_hidden is not None:
+                        _skip_state[0] = {
+                            "logits": verify_logits[:, 0, :],
+                            "hidden": verify_hidden[:, 0:1, :],
+                        }
+                        mx.async_eval(
+                            _skip_state[0]["logits"],
+                            _skip_state[0]["hidden"],
+                        )
+                    else:
+                        _skip_state[0] = None
+                for uid in current_uids:
+                    _deferred_drafts.pop(uid, None)
+                _mtp_stats["rejected"] += 1
+
+        except Exception as e:
+            logger.warning(f"[MTP-MLLM] draft/verify failed: {e}")
+            _skip_state[0] = None
+            _mtp_stats["errors"] += 1
+
+        # Log MTP stats every 50 steps
+        total = _mtp_stats["accepted"] + _mtp_stats["rejected"] + _mtp_stats["errors"]
+        if total > 0 and total % 50 == 0:
+            acc = _mtp_stats["accepted"]
+            rej = _mtp_stats["rejected"]
+            err = _mtp_stats["errors"]
+            rate = acc / (acc + rej) * 100 if (acc + rej) > 0 else 0
+            logger.info(
+                f"[MTP-MLLM] stats: accepted={acc} rejected={rej} "
+                f"errors={err} acceptance={rate:.0f}%"
+            )
+
+        return primary_tokens, list(logprobs)
+
+    # Wrap _next to emit deferred MTP drafts
+    batch_gen._inner_next = batch_gen._next
+
+    def _mtp_next() -> List[MLLMBatchResponse]:
+        """Wrapper around _next that emits deferred MTP draft tokens."""
+        if batch_gen.active_batch is None:
+            _skip_state[0] = None
+            _deferred_drafts.clear()
+
+        # Save deferred drafts from previous step
+        prev_deferred: Dict[int, dict] = {}
+        if batch_gen.active_batch is not None:
+            for uid in batch_gen.active_batch.uids:
+                if uid in _deferred_drafts:
+                    prev_deferred[uid] = _deferred_drafts.pop(uid)
+
+        responses = batch_gen._inner_next()
+
+        if not prev_deferred or not responses:
+            return responses
+
+        # Augment responses with deferred drafts
+        augmented: List[MLLMBatchResponse] = []
+        draft_end_uids: set = set()
+
+        for r in responses:
+            uid = r.uid
+            augmented.append(r)
+
+            if r.finish_reason is not None:
+                _deferred_drafts.pop(uid, None)
+                prev_deferred.pop(uid, None)
+                continue
+
+            if uid in prev_deferred:
+                draft_info = prev_deferred.pop(uid)
+                draft_t = draft_info["token"]
+                draft_lp = draft_info["logprobs"]
+
+                if draft_t in batch_gen.stop_tokens:
+                    augmented.append(
+                        MLLMBatchResponse(
+                            uid=uid,
+                            request_id=r.request_id,
+                            token=draft_t,
+                            logprobs=draft_lp,
+                            finish_reason="stop",
+                        )
+                    )
+                    draft_end_uids.add(uid)
+                else:
+                    draft_finish = None
+                    batch = batch_gen.active_batch
+                    if batch is not None:
+                        for e, bu in enumerate(batch.uids):
+                            if bu == uid:
+                                batch.num_tokens[e] += 1
+                                batch.requests[e].output_tokens.append(draft_t)
+                                if batch.num_tokens[e] >= batch.max_tokens[e]:
+                                    draft_finish = "length"
+                                    draft_end_uids.add(uid)
+                                break
+
+                    augmented.append(
+                        MLLMBatchResponse(
+                            uid=uid,
+                            request_id=r.request_id,
+                            token=draft_t,
+                            logprobs=draft_lp,
+                            finish_reason=draft_finish,
+                        )
+                    )
+
+        # Remove sequences that finished due to draft tokens
+        if draft_end_uids and batch_gen.active_batch is not None:
+            keep = [
+                e
+                for e, u in enumerate(batch_gen.active_batch.uids)
+                if u not in draft_end_uids
+            ]
+            if keep:
+                batch_gen.active_batch.filter(keep)
+            else:
+                batch_gen.active_batch = None
+
+        return augmented
+
+    batch_gen._step = _mtp_step
+    batch_gen._next = _mtp_next
+
+    total = _mtp_stats
+    logger.info(
+        f"[MTP-MLLM] installed with num_draft_tokens={num_draft_tokens}, "
+        f"always-advance verified mode"
+    )
