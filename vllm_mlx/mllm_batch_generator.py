@@ -949,6 +949,8 @@ class MLLMBatchGenerator:
         # merged into a single BatchKVCache. Merging into an active batch
         # mid-generation would cause shape mismatches in attention layers,
         # so queued requests wait until the current batch finishes.
+        # Exception: text-only requests can be extended into an active batch
+        # via the elif branch below (they skip vision encoding entirely).
         if num_active == 0:
             requests = self.unprocessed_requests[: self.completion_batch_size]
 
@@ -979,6 +981,49 @@ class MLLMBatchGenerator:
                             finish_reason="error",
                         )
                     )
+
+        # Mid-batch extend: text-only requests can join an active batch
+        # without vision encoding (no shape mismatch risk).
+        elif self.unprocessed_requests:
+            text_only = [
+                r for r in self.unprocessed_requests if not r.images and not r.videos
+            ][: self.completion_batch_size]
+
+            if text_only:
+                try:
+                    new_batch = self._process_prompts(text_only)
+                    # Remove processed requests from queue
+                    processed_uids = {r.uid for r in text_only}
+                    self.unprocessed_requests = [
+                        r
+                        for r in self.unprocessed_requests
+                        if r.uid not in processed_uids
+                    ]
+                    if new_batch is not None:
+                        batch.extend(new_batch)
+                    prompt_processing = True
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to extend batch with text-only requests: "
+                        f"{type(e).__name__}: {e}"
+                    )
+                    # Remove failed requests to avoid infinite retry loop
+                    processed_uids = {r.uid for r in text_only}
+                    self.unprocessed_requests = [
+                        r
+                        for r in self.unprocessed_requests
+                        if r.uid not in processed_uids
+                    ]
+                    for req in text_only:
+                        self._pending_error_responses.append(
+                            MLLMBatchResponse(
+                                uid=req.uid,
+                                request_id=req.request_id,
+                                token=0,
+                                logprobs=mx.zeros(1),
+                                finish_reason="error",
+                            )
+                        )
 
         # Collect any pending error responses (from failed preprocessing)
         error_responses = []
