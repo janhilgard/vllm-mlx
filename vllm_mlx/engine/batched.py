@@ -211,6 +211,10 @@ class BatchedEngine(BaseEngine):
         self._model = self._mllm_instance.model
         self._processor = self._mllm_instance.processor
 
+        # Inject MTP support if enabled
+        if self._scheduler_config and self._scheduler_config.enable_mtp:
+            self._inject_mtp_mllm()
+
         # Create MLLM scheduler config with batch generator support
         if self._scheduler_config and hasattr(self._scheduler_config, "max_num_seqs"):
             max_num_seqs = self._scheduler_config.max_num_seqs
@@ -224,6 +228,10 @@ class BatchedEngine(BaseEngine):
         )
 
         cache_memory_mb = getattr(self._scheduler_config, "cache_memory_mb", None)
+        enable_mtp = (
+            self._scheduler_config.enable_mtp if self._scheduler_config else False
+        )
+        mtp_num_draft = getattr(self._scheduler_config, "mtp_num_draft_tokens", 1)
         mllm_config = MLLMSchedulerConfig(
             max_num_seqs=max_num_seqs,
             prefill_batch_size=prefill_batch_size,
@@ -231,6 +239,8 @@ class BatchedEngine(BaseEngine):
             enable_vision_cache=True,
             vision_cache_size=100,
             cache_memory_mb=cache_memory_mb,
+            enable_mtp=enable_mtp,
+            mtp_num_draft_tokens=mtp_num_draft,
         )
 
         # Create and start MLLM scheduler
@@ -246,6 +256,54 @@ class BatchedEngine(BaseEngine):
             f"max_num_seqs={max_num_seqs}, prefill_batch={prefill_batch_size}, "
             f"completion_batch={completion_batch_size}"
         )
+
+    def _inject_mtp_mllm(self) -> None:
+        """Inject MTP weights into the MLLM model's language_model."""
+        import json
+        from pathlib import Path
+
+        from mlx_lm.utils import _download
+
+        model = self._model
+        model_path = Path(_download(self._model_name))
+        config_path = model_path / "config.json"
+        if not config_path.exists():
+            logger.warning("[MTP-MLLM] No config.json found, skipping MTP")
+            return
+
+        with open(config_path) as f:
+            config = json.load(f)
+
+        text_config = config.get("text_config", config)
+        num_mtp = text_config.get("mtp_num_hidden_layers", 0)
+        if num_mtp == 0:
+            num_mtp = text_config.get(
+                "num_nextn_predict_layers",
+                config.get("num_nextn_predict_layers", 0),
+            )
+        if num_mtp == 0:
+            logger.info("[MTP-MLLM] No MTP layers in config, skipping")
+            return
+
+        # Navigate to text model
+        text_model = model
+        if hasattr(model, "language_model"):
+            text_model = model.language_model
+        if getattr(text_model, "mtp", None) is not None:
+            logger.info("[MTP-MLLM] Model already has MTP, skipping injection")
+            return
+
+        model_type = text_config.get("model_type", config.get("model_type", ""))
+        if "qwen3_5" in model_type:
+            from ..patches.qwen3_5_mtp import inject_mtp_support
+
+            ok = inject_mtp_support(model, model_path, config)
+            if ok:
+                logger.info("[MTP-MLLM] Qwen3.5 MTP injected successfully")
+            else:
+                logger.warning("[MTP-MLLM] Qwen3.5 MTP injection failed")
+        else:
+            logger.info(f"[MTP-MLLM] MTP not supported for model_type={model_type}")
 
     async def _start_llm(self) -> None:
         """Start the LLM engine with AsyncEngineCore."""
@@ -267,9 +325,10 @@ class BatchedEngine(BaseEngine):
 
         # Validate MTP support if enabled
         if self._scheduler_config and self._scheduler_config.enable_mtp:
+            from ..patches.qwen3_5_mtp import validate_mtp_support as validate_35
             from ..patches.qwen3_next_mtp import validate_mtp_support
 
-            if validate_mtp_support(self._model):
+            if validate_mtp_support(self._model) or validate_35(self._model):
                 logger.info("[MTP] Model validated for MTP speculative decoding")
             else:
                 logger.warning(
@@ -797,6 +856,7 @@ class BatchedEngine(BaseEngine):
                 "memory_aware_cache",
                 "paged_cache",
                 "prefix_cache",
+                "requests",
             ):
                 if key in mllm_stats:
                     stats[key] = mllm_stats[key]
