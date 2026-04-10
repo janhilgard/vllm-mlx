@@ -19,6 +19,7 @@ Architecture:
 """
 
 import asyncio
+import concurrent.futures
 import logging
 import time
 import uuid
@@ -347,6 +348,9 @@ class MLLMScheduler:
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
+            top_k=kwargs.pop("top_k", 0),
+            min_p=kwargs.pop("min_p", 0.0),
+            presence_penalty=kwargs.pop("presence_penalty", 0.0),
             repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
         )
 
@@ -454,6 +458,9 @@ class MLLMScheduler:
                 max_tokens=request.sampling_params.max_tokens,
                 temperature=request.sampling_params.temperature,
                 top_p=request.sampling_params.top_p,
+                top_k=request.sampling_params.top_k,
+                min_p=request.sampling_params.min_p,
+                presence_penalty=request.sampling_params.presence_penalty,
                 repetition_penalty=request.sampling_params.repetition_penalty,
             )
             batch_requests.append(batch_req)
@@ -539,11 +546,7 @@ class MLLMScheduler:
                 new_text = ""
             else:
                 if request_id not in self._detokenizer_pool:
-                    if hasattr(tokenizer, "detokenizer"):
-                        detok = tokenizer.detokenizer
-                    else:
-                        detok = NaiveStreamingDetokenizer(tokenizer)
-                    detok.reset()
+                    detok = NaiveStreamingDetokenizer(tokenizer)
                     self._detokenizer_pool[request_id] = detok
                 detok = self._detokenizer_pool[request_id]
                 detok.add_token(response.token)
@@ -571,7 +574,7 @@ class MLLMScheduler:
                 finished_ids.add(request_id)
 
                 # Finalize streaming detokenizer and get full output
-                detok = self._detokenizer_pool.get(request_id)
+                detok = self._detokenizer_pool.pop(request_id, None)
                 if detok is not None:
                     detok.finalize()
                     output.output_text = detok.text
@@ -579,7 +582,6 @@ class MLLMScheduler:
                     output.output_text = tokenizer.decode(request.output_tokens)
                 request.output_text = output.output_text
                 request.finish_reason = response.finish_reason
-                self._detokenizer_pool.pop(request_id, None)
 
                 self.total_completion_tokens += request.num_output_tokens
                 self.num_requests_processed += 1
@@ -609,6 +611,9 @@ class MLLMScheduler:
                 if uid in self.uid_to_request_id:
                     del self.uid_to_request_id[uid]
                 del self.request_id_to_uid[request_id]
+
+            # Clean up detokenizer pool (handles abort/timeout cases)
+            self._detokenizer_pool.pop(request_id, None)
 
             # Track as finished
             self.finished_req_ids.add(request_id)
@@ -726,14 +731,33 @@ class MLLMScheduler:
         logger.info("MLLM Scheduler stopped")
 
     async def _process_loop(self) -> None:
-        """Main async processing loop."""
+        """Main async processing loop.
+
+        Uses a thread pool executor for steps that involve prefill
+        (waiting requests or partial prefill in progress) so that the
+        event loop stays responsive for health checks and other HTTP
+        endpoints.  Decode-only steps are fast (<3 ms) and run inline.
+        """
+        _executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="mllm-step"
+        )
+        loop = asyncio.get_running_loop()
+
         while self._running:
             try:
                 if self.has_requests():
-                    # Run one step
-                    self.step()
-                    # Yield to other tasks
-                    await asyncio.sleep(0)
+                    has_waiting = self.get_num_waiting() > 0
+                    has_partial = (
+                        self.batch_generator is not None
+                        and getattr(self.batch_generator, "_partial", None) is not None
+                    )
+                    needs_executor = has_waiting or has_partial
+
+                    if needs_executor:
+                        await loop.run_in_executor(_executor, self.step)
+                    else:
+                        self.step()
+                        await asyncio.sleep(0)
                 else:
                     # No work, wait a bit
                     await asyncio.sleep(0.01)
