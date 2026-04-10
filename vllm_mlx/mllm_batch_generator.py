@@ -48,6 +48,9 @@ class MLLMBatchRequest:
     max_tokens: int = 256
     temperature: float = 0.7
     top_p: float = 0.9
+    top_k: int = 0
+    min_p: float = 0.0
+    presence_penalty: float = 0.0
     repetition_penalty: float = 1.0
 
     # Processed inputs (set after vision preprocessing)
@@ -104,6 +107,7 @@ class MLLMBatch:
     cache: List[Any]  # BatchKVCache for language model
     requests: List[MLLMBatchRequest]  # Full request data
     logits_processors: Optional[List[Optional[List[Callable]]]] = None
+    samplers: Optional[List[Optional[Callable]]] = None
 
     def __len__(self) -> int:
         return len(self.uids)
@@ -123,6 +127,8 @@ class MLLMBatch:
         self.requests = [self.requests[k] for k in keep_idx]
         if self.logits_processors is not None:
             self.logits_processors = [self.logits_processors[k] for k in keep_idx]
+        if self.samplers is not None:
+            self.samplers = [self.samplers[k] for k in keep_idx]
 
         keep_idx_array = mx.array(keep_idx, mx.int32)
         self.y = self.y[keep_idx_array]
@@ -155,6 +161,13 @@ class MLLMBatch:
             other_lp = other.logits_processors or [None] * len(other.uids)
             self.logits_processors = list(self_lp) + list(other_lp)
 
+        # Extend samplers
+        if self.samplers is not None or other.samplers is not None:
+            self_len = len(self.uids) - len(other.uids)
+            self_s = self.samplers or [None] * self_len
+            other_s = other.samplers or [None] * len(other.uids)
+            self.samplers = list(self_s) + list(other_s)
+
         # Extend cache - handle both BatchKVCache (.keys/.values) and
         # ArraysCache (.cache list) from hybrid models like Qwen3.5
         for c, o in zip(self.cache, other.cache):
@@ -169,15 +182,44 @@ class MLLMBatch:
 
     def extract_cache(self, idx: int) -> List[Any]:
         """
-        Extract cache for a single request (for caching).
+        Extract cache for a single request (for prefix caching).
 
-        Args:
-            idx: Index of request in batch
-
-        Returns:
-            Cache state for that request
+        Handles BatchRotatingKVCache negative left_padding bug:
+        during generation with rotation, left_padding becomes negative,
+        causing extract() to use Python negative indexing and truncate
+        the buffer to only generation tokens instead of the full window.
         """
-        return [c.extract(idx) if hasattr(c, "extract") else None for c in self.cache]
+        from mlx_lm.models.cache import (
+            BatchRotatingKVCache,
+            RotatingKVCache,
+        )
+
+        result = []
+        for c in self.cache:
+            if not hasattr(c, "extract"):
+                result.append(None)
+            elif isinstance(c, BatchRotatingKVCache):
+                # Custom extraction: clamp left_padding to >= 0
+                cache = RotatingKVCache(c.max_size)
+                padding = max(0, c.left_padding[idx].item())
+                offset = c.offset[idx].item()
+                cache.keys = c.keys[idx : idx + 1]
+                cache.values = c.values[idx : idx + 1]
+                cache._idx = c._idx
+                if c.rotated:
+                    cache.keys = mx.roll(cache.keys, -c._idx, axis=2)
+                    cache.values = mx.roll(cache.values, -c._idx, axis=2)
+                    cache._idx = c.max_size
+                cache.keys = mx.contiguous(cache.keys[:, :, padding : cache._idx])
+                cache.values = mx.contiguous(cache.values[:, :, padding : cache._idx])
+                cache.offset = offset
+                cache._idx = cache.keys.shape[2]
+                cache.step = getattr(c, "step", c.max_size)
+                cache.keep = getattr(c, "keep", 0)
+                result.append(cache)
+            else:
+                result.append(c.extract(idx))
+        return result
 
 
 class MLLMBatchStats:
@@ -370,6 +412,9 @@ class MLLMBatchGenerator:
 
         # Error responses for requests that failed during preprocessing
         self._pending_error_responses: List[MLLMBatchResponse] = []
+
+        # Per-request prefill progress: request_id → (processed_tokens, total_tokens)
+        self._prefill_progress: Dict[str, Tuple[int, int]] = {}
 
         # Vision embedding cache for repeated images
         self.vision_cache = VisionEmbeddingCache(
@@ -594,6 +639,54 @@ class MLLMBatchGenerator:
             f"({processing_time:.2f}s)"
         )
 
+    def _run_chunked_text_prefill(
+        self, request: MLLMBatchRequest, cache: List[Any]
+    ) -> mx.array:
+        """
+        Run prefill in chunks for text-only requests, reporting real progress.
+
+        Processes input_ids in prefill_step_size chunks through the language
+        model, updating ``_prefill_progress`` after each chunk so the status
+        endpoint can report accurate prefill percentage.
+
+        Returns:
+            Logits from the last chunk (same contract as _run_vision_encoding).
+        """
+        input_ids = request.input_ids
+        if input_ids.ndim == 1:
+            input_ids = input_ids[None, :]
+
+        total = input_ids.shape[1]
+        step = self.prefill_step_size
+
+        # Short prompt — process in one shot (no chunking overhead)
+        if total <= step:
+            self._prefill_progress[request.request_id] = (total, total)
+            output = self.language_model(input_ids, cache=cache)
+            request.vision_encoded = True
+            if hasattr(output, "logits"):
+                return output.logits
+            return output
+
+        # Process all chunks except the last
+        processed = 0
+        while processed + step < total:
+            chunk = input_ids[:, processed : processed + step]
+            self.language_model(chunk, cache=cache)
+            mx.eval([c.state for c in cache])
+            processed += step
+            self._prefill_progress[request.request_id] = (processed, total)
+
+        # Last chunk — return logits for sampling
+        last_chunk = input_ids[:, processed:]
+        output = self.language_model(last_chunk, cache=cache)
+        request.vision_encoded = True
+        self._prefill_progress[request.request_id] = (total, total)
+
+        if hasattr(output, "logits"):
+            return output.logits
+        return output
+
     def _run_vision_encoding(
         self, request: MLLMBatchRequest, cache: Optional[List[Any]] = None
     ) -> mx.array:
@@ -729,9 +822,43 @@ class MLLMBatchGenerator:
                 # Prefix/LCP match — run language model on remaining tokens
                 request_cache = cached_kv
                 remaining = mx.array(remaining_ids)[None, :]
+                cached_count = len(input_ids_list) - len(remaining_ids)
+                total_tokens = len(input_ids_list)
+                remaining_count = len(remaining_ids)
 
                 with mx.stream(MLLMBatchGenerator._stream):
-                    logits = self.language_model(remaining, cache=request_cache)
+                    step = self.prefill_step_size
+                    if remaining_count <= step:
+                        # Short remaining — process in one shot
+                        self._prefill_progress[req.request_id] = (
+                            total_tokens,
+                            total_tokens,
+                        )
+                        logits = self.language_model(remaining, cache=request_cache)
+                    else:
+                        # Chunked prefill on remaining tokens
+                        self._prefill_progress[req.request_id] = (
+                            cached_count,
+                            total_tokens,
+                        )
+                        processed = 0
+                        while processed + step < remaining_count:
+                            chunk = remaining[:, processed : processed + step]
+                            self.language_model(chunk, cache=request_cache)
+                            mx.eval([c.state for c in request_cache])
+                            processed += step
+                            self._prefill_progress[req.request_id] = (
+                                cached_count + processed,
+                                total_tokens,
+                            )
+                        # Last chunk — return logits
+                        remaining = remaining[:, processed:]
+                        logits = self.language_model(remaining, cache=request_cache)
+                        self._prefill_progress[req.request_id] = (
+                            total_tokens,
+                            total_tokens,
+                        )
+
                     if hasattr(logits, "logits"):
                         logits = logits.logits
 
@@ -746,10 +873,11 @@ class MLLMBatchGenerator:
                     all_logprobs.append(logprobs.squeeze(0))
 
                 per_request_caches.append(request_cache)
+                req.vision_encoded = True
                 logger.debug(
                     f"Prefix cache hit for {req.request_id}: "
-                    f"cached={len(input_ids_list) - len(remaining_ids)}, "
-                    f"remaining={len(remaining_ids)}"
+                    f"cached={cached_count}, "
+                    f"remaining={remaining_count}"
                 )
 
             elif cached_kv is not None and not remaining_ids:
@@ -759,6 +887,11 @@ class MLLMBatchGenerator:
                 # If we get here (empty remaining), re-run on last token.
                 request_cache = cached_kv
                 last_token = req.input_ids[:, -1:]
+                total_tokens = len(input_ids_list)
+                self._prefill_progress[req.request_id] = (
+                    total_tokens,
+                    total_tokens,
+                )
 
                 with mx.stream(MLLMBatchGenerator._stream):
                     logits = self.language_model(last_token, cache=request_cache)
@@ -776,18 +909,25 @@ class MLLMBatchGenerator:
                     all_logprobs.append(logprobs.squeeze(0))
 
                 per_request_caches.append(request_cache)
+                req.vision_encoded = True
                 logger.debug(
                     f"Prefix cache exact hit for {req.request_id}: "
-                    f"all {len(input_ids_list)} tokens cached"
+                    f"all {total_tokens} tokens cached"
                 )
 
             else:
-                # Cache miss — full VLM forward pass
+                # Cache miss — full forward pass
                 request_cache = make_prompt_cache(self.language_model)
 
                 with mx.stream(MLLMBatchGenerator._stream):
-                    # Run VLM forward pass — cache= flows through to language_model
-                    logits = self._run_vision_encoding(req, cache=request_cache)
+                    # Text-only: chunked prefill with real progress tracking
+                    # Multimodal: atomic VLM forward (vision encoder needs full input)
+                    if req.is_text_only:
+                        logits = self._run_chunked_text_prefill(
+                            req, cache=request_cache
+                        )
+                    else:
+                        logits = self._run_vision_encoding(req, cache=request_cache)
 
                     # Extract last token logits and sample
                     last_logits = logits[:, -1, :]
@@ -828,6 +968,22 @@ class MLLMBatchGenerator:
                                 trim_size, layer_cache.values
                             )
                             layer_cache._idx = layer_cache.max_size
+                        # Normalize wrapped rotating cache for merge:
+                        # after rotation _idx wraps around but merge()
+                        # expects _idx == actual buffer size.
+                        # Use keys.shape[2] (actual entries) NOT size()
+                        # which can be inconsistent after prefix cache trim
+                        # (size() = min(offset, max_size) but buffer may
+                        # have fewer entries when trimmed).
+                        actual_buf = layer_cache.keys.shape[2]
+                        if layer_cache._idx != actual_buf and actual_buf > 0:
+                            layer_cache.keys = layer_cache._temporal_order(
+                                layer_cache.keys
+                            )
+                            layer_cache.values = layer_cache._temporal_order(
+                                layer_cache.values
+                            )
+                            layer_cache._idx = actual_buf
 
         try:
             batch_cache = [
@@ -847,22 +1003,50 @@ class MLLMBatchGenerator:
         # Create initial y (first generated tokens)
         y = mx.array(first_tokens)
 
-        # Build per-request logits processors from repetition_penalty
-        from mlx_lm.sample_utils import make_logits_processors
+        # Build per-request logits processors (repetition_penalty, presence_penalty)
+        from mlx_lm.sample_utils import make_logits_processors, make_sampler
 
         batch_logits_processors = []
-        has_any = False
+        has_any_lp = False
         for req in requests:
-            if req.repetition_penalty and req.repetition_penalty != 1.0:
-                lp = make_logits_processors(repetition_penalty=req.repetition_penalty)
+            need_rep = req.repetition_penalty and req.repetition_penalty != 1.0
+            need_pres = req.presence_penalty and req.presence_penalty != 0.0
+            if need_rep or need_pres:
+                lp_kwargs = {}
+                if need_rep:
+                    lp_kwargs["repetition_penalty"] = req.repetition_penalty
+                if need_pres:
+                    lp_kwargs["presence_penalty"] = req.presence_penalty
+                lp = make_logits_processors(**lp_kwargs)
                 batch_logits_processors.append(lp)
-                has_any = True
+                has_any_lp = True
                 logger.info(
-                    f"[rep_penalty] request={req.request_id[:12]} "
-                    f"penalty={req.repetition_penalty}"
+                    f"[sampling] request={req.request_id[:12]} "
+                    f"rep_penalty={req.repetition_penalty} "
+                    f"pres_penalty={req.presence_penalty}"
                 )
             else:
                 batch_logits_processors.append(None)
+
+        # Build per-request samplers for top_k/min_p
+        batch_samplers = []
+        has_any_sampler = False
+        for req in requests:
+            if req.top_k != 0 or req.min_p != 0.0:
+                s = make_sampler(
+                    temp=req.temperature,
+                    top_p=req.top_p,
+                    top_k=req.top_k,
+                    min_p=req.min_p,
+                )
+                batch_samplers.append(s)
+                has_any_sampler = True
+                logger.info(
+                    f"[sampling] request={req.request_id[:12]} "
+                    f"top_k={req.top_k} min_p={req.min_p}"
+                )
+            else:
+                batch_samplers.append(None)
 
         self._stats.prompt_time += time.perf_counter() - tic
 
@@ -875,7 +1059,8 @@ class MLLMBatchGenerator:
             num_tokens=[0] * len(requests),
             cache=batch_cache,
             requests=requests,
-            logits_processors=batch_logits_processors if has_any else None,
+            logits_processors=batch_logits_processors if has_any_lp else None,
+            samplers=batch_samplers if has_any_sampler else None,
         )
 
     def _step(
@@ -884,6 +1069,7 @@ class MLLMBatchGenerator:
         cache: List[Any],
         logits_processors: Optional[List[Optional[List[Callable]]]] = None,
         output_tokens: Optional[List[List[int]]] = None,
+        samplers: Optional[List[Optional[Callable]]] = None,
     ) -> Tuple[mx.array, List[mx.array]]:
         """
         Run one generation step through the language model.
@@ -893,6 +1079,7 @@ class MLLMBatchGenerator:
             cache: BatchKVCache for the language model
             logits_processors: Per-request logits processors (e.g. repetition penalty)
             output_tokens: Per-request generated tokens so far (needed by processors)
+            samplers: Per-request sampler functions (for top_k/min_p)
 
         Returns:
             Tuple of (sampled tokens, logprobs list)
@@ -925,9 +1112,16 @@ class MLLMBatchGenerator:
                 processed_logits.append(sample_logits)
             logits = mx.concatenate(processed_logits, axis=0)
 
-        # Sample
+        # Sample — per-request samplers for top_k/min_p support
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        sampled = self.sampler(logprobs)
+        if samplers and any(samplers):
+            sampled_list = []
+            for e in range(logprobs.shape[0]):
+                s = samplers[e] if samplers[e] else self.sampler
+                sampled_list.append(s(logprobs[e : e + 1]))
+            sampled = mx.concatenate(sampled_list, axis=0)
+        else:
+            sampled = self.sampler(logprobs)
 
         return sampled, list(logprobs)
 
@@ -1043,7 +1237,11 @@ class MLLMBatchGenerator:
             else None
         )
         batch.y, batch.logprobs = self._step(
-            y[:, None], batch.cache, batch.logits_processors, output_tokens
+            y[:, None],
+            batch.cache,
+            batch.logits_processors,
+            output_tokens,
+            batch.samplers,
         )
         mx.async_eval(batch.y, batch.logprobs)
 
@@ -1090,6 +1288,8 @@ class MLLMBatchGenerator:
             if finish_reason is not None:
                 # Extract cache for this request
                 cache_fn = lambda idx=i: batch.extract_cache(idx)
+                # Cleanup prefill progress tracking
+                self._prefill_progress.pop(request_id, None)
 
             responses.append(
                 MLLMBatchResponse(
@@ -1158,6 +1358,10 @@ class MLLMBatchGenerator:
                 except Exception as e:
                     logger.warning(f"[prefix_store] FAILED: {type(e).__name__}: {e}")
 
+    def get_prefill_progress(self, request_id: str) -> Optional[Tuple[int, int]]:
+        """Return (processed_tokens, total_tokens) or None."""
+        return self._prefill_progress.get(request_id)
+
     def get_vision_cache_stats(self) -> Dict[str, Any]:
         """Get vision cache statistics."""
         return self.vision_cache.get_stats()
@@ -1221,6 +1425,7 @@ def install_mtp_mllm(
         cache: List[Any],
         logits_processors: Optional[List[Optional[List[Callable]]]] = None,
         output_tokens: Optional[List[List[int]]] = None,
+        samplers: Optional[List[Optional[Callable]]] = None,
     ) -> Tuple[mx.array, List[mx.array]]:
         """Extended _step with MTP always-advance strategy."""
         batch_size = input_tokens.shape[0]
@@ -1234,7 +1439,9 @@ def install_mtp_mllm(
             or len(batch_gen.active_batch) > 1
         ):
             _skip_state[0] = None
-            return _orig_step(input_tokens, cache, logits_processors, output_tokens)
+            return _orig_step(
+                input_tokens, cache, logits_processors, output_tokens, samplers
+            )
 
         # Check skip state
         skip = _skip_state[0]
@@ -1252,7 +1459,9 @@ def install_mtp_mllm(
             if isinstance(model_output, tuple):
                 logits, hidden_states = model_output
             else:
-                return _orig_step(input_tokens, cache, logits_processors, output_tokens)
+                return _orig_step(
+                    input_tokens, cache, logits_processors, output_tokens, samplers
+                )
             logits = logits[:, -1, :]
 
         # Apply logits processors before sampling
@@ -1268,9 +1477,16 @@ def install_mtp_mllm(
                 processed_logits.append(sample_logits)
             logits = mx.concatenate(processed_logits, axis=0)
 
-        # Sample primary
+        # Sample primary (use per-request sampler if available)
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        primary_tokens = batch_gen.sampler(logprobs)
+        if samplers and any(samplers):
+            sampled_list = []
+            for e in range(logprobs.shape[0]):
+                s = samplers[e] if samplers[e] else batch_gen.sampler
+                sampled_list.append(s(logprobs[e : e + 1]))
+            primary_tokens = mx.concatenate(sampled_list, axis=0)
+        else:
+            primary_tokens = batch_gen.sampler(logprobs)
 
         current_uids = list(batch_gen.active_batch.uids)
 
