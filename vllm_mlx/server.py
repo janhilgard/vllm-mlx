@@ -59,7 +59,12 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 # Import from new modular API
 # Re-export for backwards compatibility with tests
 from .api.anthropic_adapter import anthropic_to_openai, openai_to_anthropic
-from .api.anthropic_models import AnthropicRequest
+from .api.anthropic_models import (
+    AnthropicRequest,
+    AnthropicResponse,
+    AnthropicResponseContentBlock,
+    AnthropicUsage,
+)
 from .api.models import (
     AssistantMessage,  # noqa: F401
     ChatCompletionChoice,  # noqa: F401
@@ -655,14 +660,11 @@ async def health():
             "tools_available": len(_mcp_manager.get_all_tools()),
         }
 
-    engine_stats = _engine.get_stats() if _engine else {}
-
     return {
         "status": "healthy",
         "model_loaded": _engine is not None,
         "model_name": _model_name,
         "model_type": "mllm" if (_engine and _engine.is_mllm) else "llm",
-        "engine_type": engine_stats.get("engine_type", "unknown"),
         "mcp": mcp_info,
     }
 
@@ -1627,6 +1629,17 @@ def _inject_json_instruction(messages: list, instruction: str) -> list:
 # =============================================================================
 
 
+def _convert_anthropic_stop_reason(openai_reason: str | None) -> str:
+    """Convert OpenAI finish_reason to Anthropic stop_reason."""
+    mapping = {
+        "stop": "end_turn",
+        "tool_calls": "tool_use",
+        "length": "max_tokens",
+        "content_filter": "end_turn",
+    }
+    return mapping.get(openai_reason or "", "end_turn")
+
+
 @app.post("/v1/messages")
 async def create_anthropic_message(
     request: Request,
@@ -1719,35 +1732,63 @@ async def create_anthropic_message(
         output.text, openai_request
     )
 
+    # Extract reasoning if parser is configured
+    reasoning_text = None
+    if _reasoning_parser and not tool_calls:
+        text_to_parse = cleaned_text or output.text
+        reasoning_text, cleaned_text = _reasoning_parser.extract_reasoning(
+            text_to_parse
+        )
+
     # Clean output text
     final_content = None
     if cleaned_text:
         final_content = clean_output_text(cleaned_text)
 
-    # Determine finish reason
-    finish_reason = "tool_calls" if tool_calls else output.finish_reason
+    # Build Anthropic content blocks directly (with thinking support)
+    content_blocks = []
 
-    # Build OpenAI response to convert
-    openai_response = ChatCompletionResponse(
-        model=_model_name,
-        choices=[
-            ChatCompletionChoice(
-                message=AssistantMessage(
-                    content=final_content,
-                    tool_calls=tool_calls,
-                ),
-                finish_reason=finish_reason,
+    if reasoning_text:
+        content_blocks.append(
+            AnthropicResponseContentBlock(type="thinking", thinking=reasoning_text)
+        )
+
+    if final_content:
+        content_blocks.append(
+            AnthropicResponseContentBlock(type="text", text=final_content)
+        )
+
+    if tool_calls:
+        for tc in tool_calls:
+            try:
+                tool_input = json.loads(tc.function.arguments)
+            except (json.JSONDecodeError, AttributeError):
+                tool_input = {}
+            content_blocks.append(
+                AnthropicResponseContentBlock(
+                    type="tool_use",
+                    id=tc.id,
+                    name=tc.function.name,
+                    input=tool_input,
+                )
             )
-        ],
-        usage=Usage(
-            prompt_tokens=output.prompt_tokens,
-            completion_tokens=output.completion_tokens,
-            total_tokens=output.prompt_tokens + output.completion_tokens,
-        ),
+
+    if not content_blocks:
+        content_blocks.append(AnthropicResponseContentBlock(type="text", text=""))
+
+    stop_reason = _convert_anthropic_stop_reason(
+        "tool_calls" if tool_calls else output.finish_reason
     )
 
-    # Convert to Anthropic response
-    anthropic_response = openai_to_anthropic(openai_response, _model_name)
+    anthropic_response = AnthropicResponse(
+        model=_model_name,
+        content=content_blocks,
+        stop_reason=stop_reason,
+        usage=AnthropicUsage(
+            input_tokens=output.prompt_tokens,
+            output_tokens=output.completion_tokens,
+        ),
+    )
     return Response(
         content=anthropic_response.model_dump_json(exclude_none=True),
         media_type="application/json",
@@ -1835,6 +1876,10 @@ async def _stream_anthropic_messages(
     Converts OpenAI streaming chunks to Anthropic event format:
     message_start -> content_block_start -> content_block_delta* ->
     content_block_stop -> message_delta -> message_stop
+
+    When a reasoning parser is active, emits a ``thinking`` content block
+    (index 0) for reasoning tokens and a ``text`` content block (index 1)
+    for the actual response, matching the Anthropic extended thinking format.
     """
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
     start_time = time.perf_counter()
@@ -1873,13 +1918,22 @@ async def _stream_anthropic_messages(
     }
     yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
 
-    # Emit content_block_start for text
-    content_block_start = {
-        "type": "content_block_start",
-        "index": 0,
-        "content_block": {"type": "text", "text": ""},
-    }
-    yield f"event: content_block_start\ndata: {json.dumps(content_block_start)}\n\n"
+    use_reasoning = _reasoning_parser is not None
+
+    if use_reasoning:
+        _reasoning_parser.reset_state()
+
+    # Block index tracking: with reasoning parser we use index 0 for
+    # thinking and index 1 for text; without parser, index 0 for text.
+    thinking_block_started = False
+    text_block_started = False
+    thinking_index = 0
+    text_index = 1 if use_reasoning else 0
+
+    if not use_reasoning:
+        # No reasoning parser — start text block immediately
+        yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+        text_block_started = True
 
     # Stream content deltas
     accumulated_text = ""
@@ -1892,57 +1946,76 @@ async def _stream_anthropic_messages(
         if hasattr(output, "completion_tokens") and output.completion_tokens:
             completion_tokens = output.completion_tokens
 
-        if delta_text:
-            # Filter special tokens
-            content = SPECIAL_TOKENS_PATTERN.sub("", delta_text)
+        if not delta_text:
+            continue
 
-            if content:
-                accumulated_text += content
-                delta_event = {
-                    "type": "content_block_delta",
-                    "index": 0,
-                    "delta": {"type": "text_delta", "text": content},
-                }
-                yield f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n"
+        # Filter special tokens
+        filtered = SPECIAL_TOKENS_PATTERN.sub("", delta_text)
+        if not filtered:
+            continue
+
+        if not use_reasoning:
+            # Simple path — no reasoning parsing
+            accumulated_text += filtered
+            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': filtered}})}\n\n"
+            continue
+
+        # Reasoning parser path
+        previous_text = accumulated_text
+        accumulated_text += filtered
+        delta_msg = _reasoning_parser.extract_reasoning_streaming(
+            previous_text, accumulated_text, filtered
+        )
+
+        if delta_msg is None:
+            continue
+
+        if delta_msg.reasoning:
+            if not thinking_block_started:
+                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': thinking_index, 'content_block': {'type': 'thinking', 'thinking': ''}})}\n\n"
+                thinking_block_started = True
+            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': thinking_index, 'delta': {'type': 'thinking_delta', 'thinking': delta_msg.reasoning}})}\n\n"
+
+        if delta_msg.content:
+            if thinking_block_started and not text_block_started:
+                # Close thinking block, open text block
+                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': thinking_index})}\n\n"
+                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': text_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+                text_block_started = True
+            elif not text_block_started:
+                # No thinking was emitted, start text block at index 0
+                text_index = 0
+                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': text_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+                text_block_started = True
+            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': text_index, 'delta': {'type': 'text_delta', 'text': delta_msg.content}})}\n\n"
+
+    # Close any open thinking block that was never followed by text
+    if thinking_block_started and not text_block_started:
+        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': thinking_index})}\n\n"
+        # Emit empty text block so response always has text content
+        text_index = thinking_index + 1
+        yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': text_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+        text_block_started = True
 
     # Check for tool calls in accumulated text
     _, tool_calls = _parse_tool_calls_with_parser(accumulated_text, openai_request)
 
-    # Emit content_block_stop for text block
-    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+    # Close text block
+    if text_block_started:
+        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': text_index})}\n\n"
 
     # If there are tool calls, emit tool_use blocks
+    next_index = (text_index + 1) if text_block_started else 0
     if tool_calls:
         for i, tc in enumerate(tool_calls):
-            tool_index = i + 1
+            tool_index = next_index + i
             try:
                 tool_input = json.loads(tc.function.arguments)
             except (json.JSONDecodeError, AttributeError):
                 tool_input = {}
 
-            # content_block_start for tool_use
-            tool_block_start = {
-                "type": "content_block_start",
-                "index": tool_index,
-                "content_block": {
-                    "type": "tool_use",
-                    "id": tc.id,
-                    "name": tc.function.name,
-                    "input": {},
-                },
-            }
-            yield f"event: content_block_start\ndata: {json.dumps(tool_block_start)}\n\n"
-
-            # Send input as a single delta
-            input_json = json.dumps(tool_input)
-            input_delta = {
-                "type": "content_block_delta",
-                "index": tool_index,
-                "delta": {"type": "input_json_delta", "partial_json": input_json},
-            }
-            yield f"event: content_block_delta\ndata: {json.dumps(input_delta)}\n\n"
-
-            # content_block_stop
+            yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': tool_index, 'content_block': {'type': 'tool_use', 'id': tc.id, 'name': tc.function.name, 'input': {}}})}\n\n"
+            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': tool_index, 'delta': {'type': 'input_json_delta', 'partial_json': json.dumps(tool_input)}})}\n\n"
             yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': tool_index})}\n\n"
 
     # Determine stop reason
