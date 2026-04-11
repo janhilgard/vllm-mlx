@@ -16,8 +16,7 @@ from .abstract_tool_parser import (
     ToolParser,
     ToolParserManager,
 )
-from .gemma4_tool_parser import TOOL_CALL_PATTERN as GEMMA4_PATTERN
-from .gemma4_tool_parser import _gemma_args_to_json
+from .gemma4_tool_parser import Gemma4ToolParser
 
 
 def generate_tool_id() -> str:
@@ -68,37 +67,10 @@ class AutoToolParser(ToolParser):
 
         # 1. Try Gemma 4 format (most distinctive marker)
         if "<|tool_call>" in model_output:
-            gemma_matches = GEMMA4_PATTERN.findall(model_output)
-            for name, raw_args in gemma_matches:
-                try:
-                    json_str = "{" + _gemma_args_to_json(raw_args) + "}"
-                    arguments = json.loads(json_str)
-                    tool_calls.append(
-                        {
-                            "id": generate_tool_id(),
-                            "name": name.strip(),
-                            "arguments": (
-                                json.dumps(arguments, ensure_ascii=False)
-                                if isinstance(arguments, dict)
-                                else str(arguments)
-                            ),
-                        }
-                    )
-                except (json.JSONDecodeError, ValueError):
-                    tool_calls.append(
-                        {
-                            "id": generate_tool_id(),
-                            "name": name.strip(),
-                            "arguments": raw_args,
-                        }
-                    )
-            if gemma_matches:
-                cleaned_text = GEMMA4_PATTERN.sub("", cleaned_text).strip()
-                return ExtractedToolCallInformation(
-                    tools_called=True,
-                    tool_calls=tool_calls,
-                    content=cleaned_text if cleaned_text else None,
-                )
+            gemma_parser = Gemma4ToolParser()
+            result = gemma_parser.extract_tool_calls(model_output, request)
+            if result.tools_called:
+                return result
 
         # 2. Try Mistral format
         if self.MISTRAL_TOKEN in model_output:

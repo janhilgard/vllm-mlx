@@ -533,7 +533,6 @@ class MLLMBatchGenerator:
                     break
 
             if applicator is None:
-                logger.warning("[think_suffix] No apply_chat_template found")
                 return 0
 
             dummy = [{"role": "user", "content": "x"}]
@@ -551,10 +550,7 @@ class MLLMBatchGenerator:
                     add_generation_prompt=True,
                     enable_thinking=False,
                 )
-            except TypeError as e:
-                logger.warning(
-                    f"[think_suffix] Template doesn't support enable_thinking: {e}"
-                )
+            except TypeError:
                 return 0
 
             # Check if enable_thinking adds a known think tag at the end.
@@ -564,22 +560,17 @@ class MLLMBatchGenerator:
                 if text_with.endswith(tag) and not text_without.endswith(tag):
                     tokenizer = getattr(self.processor, "tokenizer", self.processor)
                     suffix_tokens = tokenizer.encode(tag)
-                    # encode may add BOS — compare with encoding of empty/short
                     base_tokens = tokenizer.encode("")
                     suffix_len = len(suffix_tokens) - len(base_tokens)
-                    logger.info(
-                        f"[think_suffix] Detected think tag '{tag.strip()}' = "
-                        f"{suffix_len} token(s) (ids={suffix_tokens[-suffix_len:] if suffix_len > 0 else []})"
-                    )
+                    if suffix_len > 0:
+                        logger.info(
+                            f"[think_suffix] Detected think tag "
+                            f"'{tag.strip()}' = {suffix_len} token(s)"
+                        )
                     return max(0, suffix_len)
 
-            logger.warning(
-                f"[think_suffix] No known think tag at end. "
-                f"with_end='{text_with[-40:]}' without_end='{text_without[-40:]}'"
-            )
             return 0
-        except Exception as e:
-            logger.warning(f"[think_suffix] Failed to compute: {e}")
+        except Exception:
             return 0
 
     def close(self) -> None:
@@ -1594,10 +1585,6 @@ class MLLMBatchGenerator:
                     logger.warning(
                         f"Failed to store prefix cache for {req.request_id}: {type(e).__name__}: {e}"
                     )
-
-    def get_prefill_progress(self, request_id: str) -> Optional[Tuple[int, int]]:
-        """Return (processed_tokens, total_tokens) or None."""
-        return self._prefill_progress.get(request_id)
 
     def get_prefill_progress(self, request_id: str) -> Optional[Tuple[int, int]]:
         """Return (processed_tokens, total_tokens) or None."""

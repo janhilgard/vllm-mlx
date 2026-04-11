@@ -20,6 +20,7 @@ Available parsers:
 - functionary/meetkai: MeetKai Functionary models
 - glm47/glm4: GLM-4.7 and GLM-4.7-Flash models
 - harmony/gpt-oss: GPT-OSS models (Harmony format with channels)
+- minimax: MiniMax-M2 models
 
 Usage:
     from vllm_mlx.tool_parsers import ToolParserManager

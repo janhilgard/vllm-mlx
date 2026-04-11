@@ -435,7 +435,11 @@ def main():
 
     # Extract, optionally quantize, and save MTP weights
     mtp_file, mtp_weight_keys = extract_and_quantize_mtp_weights(
-        mtp_key_map, shard_paths, snapshot_dir, is_moe, num_experts,
+        mtp_key_map,
+        shard_paths,
+        snapshot_dir,
+        is_moe,
+        num_experts,
         no_quantize=args.no_quantize,
     )
 

@@ -142,9 +142,7 @@ class QwenToolParser(ToolParser):
                             {
                                 "id": generate_tool_id(),
                                 "name": name.strip(),
-                                "arguments": json.dumps(
-                                    arguments, ensure_ascii=False
-                                ),
+                                "arguments": json.dumps(arguments, ensure_ascii=False),
                             }
                         )
                         continue

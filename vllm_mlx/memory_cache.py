@@ -270,7 +270,7 @@ def _trim_cache_offset(cache: list[Any], trim_by: int) -> list[Any]:
     Supports KVCache, RotatingKVCache, and _QuantizedCacheWrapper.
     """
     import mlx.core as mx
-    from mlx_lm.models.cache import KVCache, RotatingKVCache
+    from mlx_lm.models.cache import RotatingKVCache
 
     trimmed: list[Any] = []
     eval_targets: list[Any] = []

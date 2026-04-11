@@ -1473,12 +1473,14 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             messages.append(msg_dict)
         images, videos = [], []  # MLLM extracts these from messages
         logger.debug(f"MLLM: Processing {len(messages)} messages")
+        messages = _normalize_messages(messages)
     else:
         # For LLM, extract text, images, and videos separately
         messages, images, videos = extract_multimodal_content(
             request.messages,
             preserve_native_format=engine.preserve_native_tool_format,
         )
+        messages = _normalize_messages(messages)
 
     has_media = bool(images or videos)
     if engine.is_mllm and not has_media:
@@ -1618,6 +1620,64 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     )
 
 
+def _normalize_messages(messages: list[dict]) -> list[dict]:
+    """Normalize message roles and merge consecutive same-role messages.
+
+    1. Maps non-standard roles to standard ones (e.g. ``developer`` -> ``system``).
+    2. Merges consecutive same-role messages to satisfy chat template constraints
+       (Qwen 3.5, Llama, etc. require alternating roles).
+
+    Only merges when both messages have string content. Messages with list
+    content (multimodal) are left as-is to preserve image/video attachments.
+
+    Args:
+        messages: List of message dicts with 'role' and 'content' keys.
+
+    Returns:
+        New list with normalized roles and consecutive same-role messages merged.
+    """
+    # OpenAI Responses API uses "developer" instead of "system".
+    # Map it so chat templates don't fail and fall back to raw prefill.
+    _ROLE_MAP = {"developer": "system"}
+
+    if not messages:
+        return messages
+
+    merged = [messages[0].copy()]
+    if merged[0]["role"] in _ROLE_MAP:
+        merged[0]["role"] = _ROLE_MAP[merged[0]["role"]]
+    for msg in messages[1:]:
+        prev = merged[-1]
+        role = _ROLE_MAP.get(msg["role"], msg["role"])
+        if (
+            role == prev["role"]
+            and isinstance(prev.get("content"), str)
+            and isinstance(msg.get("content"), str)
+        ):
+            # Merge string content with double newline separator
+            prev["content"] = prev["content"] + "\n\n" + msg["content"]
+            logger.debug(
+                f"Merged consecutive {role} messages "
+                f"({len(prev['content'])} chars total)"
+            )
+        else:
+            copy = msg.copy()
+            copy["role"] = role
+            merged.append(copy)
+
+    mapped_roles = sum(1 for m in messages if m["role"] in _ROLE_MAP)
+    merged_count = len(messages) - len(merged)
+    if mapped_roles or merged_count:
+        parts = []
+        if mapped_roles:
+            parts.append(f"mapped {mapped_roles} role(s)")
+        if merged_count:
+            parts.append(f"merged {len(messages)} -> {len(merged)}")
+        logger.info(f"Normalized messages: {', '.join(parts)}")
+
+    return merged
+
+
 def _inject_json_instruction(messages: list, instruction: str) -> list:
     """
     Inject JSON instruction into messages.
@@ -1737,6 +1797,7 @@ async def create_anthropic_message(
         openai_request.messages,
         preserve_native_format=engine.preserve_native_tool_format,
     )
+    messages = _normalize_messages(messages)
 
     chat_kwargs = {
         "max_tokens": openai_request.max_tokens or _default_max_tokens,
@@ -1902,6 +1963,59 @@ async def count_anthropic_tokens(request: Request):
     return {"input_tokens": total_tokens}
 
 
+def _emit_content_pieces(
+    pieces: list[tuple[str, str]],
+    current_block_type: str | None,
+    block_index: int,
+) -> tuple[list[str], str | None, int]:
+    """Emit Anthropic SSE events for content pieces from the think router.
+
+    Handles block type transitions (thinking <-> text), emitting
+    content_block_start/stop/delta events as needed.
+
+    Args:
+        pieces: List of (block_type, text) from StreamingThinkRouter
+        current_block_type: Current open block type, or None
+        block_index: Current block index
+
+    Returns:
+        Tuple of (events, updated_block_type, updated_block_index)
+    """
+    events = []
+    for block_type, text in pieces:
+        if block_type != current_block_type:
+            # Close previous block if open
+            if current_block_type is not None:
+                events.append(
+                    f"event: content_block_stop\ndata: "
+                    f"{json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
+                )
+                block_index += 1
+            # Start new block
+            current_block_type = block_type
+            content_block = (
+                {"type": block_type, "text": ""}
+                if block_type == "text"
+                else {"type": block_type, "thinking": ""}
+            )
+            events.append(
+                f"event: content_block_start\ndata: "
+                f"{json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': content_block})}\n\n"
+            )
+        # Emit delta
+        delta_key = "thinking" if block_type == "thinking" else "text"
+        delta_type = "thinking_delta" if block_type == "thinking" else "text_delta"
+        delta_event = {
+            "type": "content_block_delta",
+            "index": block_index,
+            "delta": {"type": delta_type, delta_key: text},
+        }
+        events.append(
+            f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n"
+        )
+    return events, current_block_type, block_index
+
+
 async def _stream_anthropic_messages(
     engine: BaseEngine,
     openai_request: ChatCompletionRequest,
@@ -1926,6 +2040,7 @@ async def _stream_anthropic_messages(
         openai_request.messages,
         preserve_native_format=engine.preserve_native_tool_format,
     )
+    messages = _normalize_messages(messages)
 
     chat_kwargs = {
         "max_tokens": openai_request.max_tokens or _default_max_tokens,
@@ -2329,7 +2444,7 @@ async def stream_chat_completion(
                             # Still emit reasoning while buffering tool call
                             chunk = ChatCompletionChunk(
                                 id=response_id,
-                                model=request.model,
+                                model=_model_name,
                                 choices=[
                                     ChatCompletionChunkChoice(
                                         delta=ChatCompletionChunkDelta(
@@ -2361,7 +2476,7 @@ async def stream_chat_completion(
                                     )
                         chunk = ChatCompletionChunk(
                             id=response_id,
-                            model=request.model,
+                            model=_model_name,
                             choices=[
                                 ChatCompletionChunkChoice(
                                     delta=ChatCompletionChunkDelta(
@@ -2497,14 +2612,15 @@ async def stream_chat_completion(
             yield f"data: {chunk.model_dump_json()}\n\n"
 
     # Fallback: if tool parser accumulated text but never emitted tool_calls
-    # (e.g., </tool_call> never arrived - incomplete tool call)
+    # (e.g., </tool_call> never arrived, or <function= block still incomplete)
     if (
         tool_parser
         and tool_accumulated_text
         and not tool_calls_detected
         and (
             "<tool_call>" in tool_accumulated_text
-            or "<function=" in tool_accumulated_text
+            or "<|tool_call>" in tool_accumulated_text
+            or "<function" in tool_accumulated_text
         )
     ):
         result = tool_parser.extract_tool_calls(tool_accumulated_text)
