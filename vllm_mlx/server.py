@@ -2038,6 +2038,12 @@ async def _stream_anthropic_messages(
                     if not content_to_emit:
                         continue
 
+            # Safety net: suppress leaked tool markup
+            if tool_parser and content_to_emit and "<function" in content_to_emit:
+                tool_accumulated_text += content_to_emit
+                tool_markup_possible = True
+                continue
+
             yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': content_to_emit}})}\n\n"
             continue
 
@@ -2080,6 +2086,14 @@ async def _stream_anthropic_messages(
                         content_to_emit = _TOOL_MARKUP_PATTERN.sub("", content_to_emit)
                     if not content_to_emit:
                         continue
+
+            # Safety net: suppress any leaked tool markup that slipped through
+            # the streaming parser (e.g. partial markers from MTP multi-token
+            # deltas or reasoning parser splits).
+            if tool_parser and content_to_emit and "<function" in content_to_emit:
+                tool_accumulated_text += content_to_emit
+                tool_markup_possible = True
+                continue
 
             if thinking_block_started and not text_block_started:
                 # Close thinking block, open text block
@@ -2488,7 +2502,10 @@ async def stream_chat_completion(
         tool_parser
         and tool_accumulated_text
         and not tool_calls_detected
-        and "<tool_call>" in tool_accumulated_text
+        and (
+            "<tool_call>" in tool_accumulated_text
+            or "<function=" in tool_accumulated_text
+        )
     ):
         result = tool_parser.extract_tool_calls(tool_accumulated_text)
         if result.tools_called:
