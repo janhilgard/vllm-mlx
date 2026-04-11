@@ -1599,6 +1599,10 @@ class MLLMBatchGenerator:
         """Return (processed_tokens, total_tokens) or None."""
         return self._prefill_progress.get(request_id)
 
+    def get_prefill_progress(self, request_id: str) -> Optional[Tuple[int, int]]:
+        """Return (processed_tokens, total_tokens) or None."""
+        return self._prefill_progress.get(request_id)
+
     def get_vision_cache_stats(self) -> Dict[str, Any]:
         """Get vision cache statistics."""
         return self.vision_cache.get_stats()
