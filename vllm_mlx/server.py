@@ -1093,15 +1093,19 @@ async def _disconnect_guard(
     generator: AsyncIterator[str],
     raw_request: Request,
     poll_interval: float = 0.5,
+    heartbeat_interval: float = 5.0,
 ) -> AsyncIterator[str]:
     """Wrap streaming generator to abort on client disconnect.
 
     Uses asyncio racing: each __anext__() on the inner generator is
-    raced against a disconnect poller.  This catches disconnects even
-    during prefill when no chunks are being yielded for tens of seconds.
+    raced against a disconnect poller.  When neither completes within
+    ``heartbeat_interval`` seconds, an SSE comment is yielded as a
+    heartbeat.  This forces an ASGI write which triggers broken-pipe
+    detection — without heartbeats, ``is_disconnected()`` stays False
+    during long prefill because no data is written to the socket.
 
-    On disconnect, aclose() propagates down the generator chain to
-    engine_core.stream_outputs() finally-block → abort_request().
+    On disconnect, the cancellation propagates to stream_outputs()
+    finally-block → abort_request() → abort_prefill().
     """
     import time as _time
 
@@ -1110,7 +1114,9 @@ async def _disconnect_guard(
     def _elapsed():
         return f"{_time.monotonic() - _t0:.1f}s"
 
-    logger.info(f"[disconnect_guard] START poll_interval={poll_interval}s")
+    logger.info(
+        f"[disconnect_guard] START poll={poll_interval}s heartbeat={heartbeat_interval}s"
+    )
 
     async def _wait_disconnect():
         poll_count = 0
@@ -1127,21 +1133,28 @@ async def _disconnect_guard(
                 return
 
     chunk_count = 0
+    heartbeat_count = 0
     disconnect_task: asyncio.Task | None = None
     anext_task: asyncio.Task | None = None
     try:
         aiter = generator.__aiter__()
         disconnect_task = asyncio.create_task(_wait_disconnect())
+        anext_task = None
         while True:
-            anext_task = asyncio.ensure_future(aiter.__anext__())
+            if anext_task is None:
+                anext_task = asyncio.ensure_future(aiter.__anext__())
+
             done, _ = await asyncio.wait(
                 [anext_task, disconnect_task],
                 return_when=asyncio.FIRST_COMPLETED,
+                timeout=heartbeat_interval,
             )
+
             if disconnect_task in done:
                 logger.info(
                     f"[disconnect_guard] CLIENT DISCONNECTED after "
-                    f"{chunk_count} chunks, elapsed={_elapsed()}"
+                    f"{chunk_count} chunks, {heartbeat_count} heartbeats, "
+                    f"elapsed={_elapsed()}"
                 )
                 anext_task.cancel()
                 try:
@@ -1149,20 +1162,32 @@ async def _disconnect_guard(
                 except (asyncio.CancelledError, StopAsyncIteration):
                     pass
                 break
-            try:
-                chunk = anext_task.result()
-            except StopAsyncIteration:
-                logger.info(
-                    f"[disconnect_guard] generator exhausted normally, "
-                    f"{chunk_count} chunks, elapsed={_elapsed()}"
-                )
-                break
-            chunk_count += 1
-            if chunk_count == 1:
-                logger.info(
-                    f"[disconnect_guard] first chunk arrived, elapsed={_elapsed()}"
-                )
-            yield chunk
+
+            if anext_task in done:
+                try:
+                    chunk = anext_task.result()
+                except StopAsyncIteration:
+                    logger.info(
+                        f"[disconnect_guard] generator exhausted normally, "
+                        f"{chunk_count} chunks, elapsed={_elapsed()}"
+                    )
+                    break
+                chunk_count += 1
+                if chunk_count == 1:
+                    logger.info(
+                        f"[disconnect_guard] first chunk arrived, elapsed={_elapsed()}"
+                    )
+                yield chunk
+                anext_task = None
+                continue
+
+            # Timeout — no chunk and no disconnect detected yet.
+            # Send SSE comment as heartbeat to force an ASGI write.
+            # If the client has disconnected, this write will fail and
+            # the next is_disconnected() poll will return True.
+            heartbeat_count += 1
+            yield ": heartbeat\n\n"
+
     except GeneratorExit:
         logger.info(
             f"[disconnect_guard] GeneratorExit after {chunk_count} chunks, elapsed={_elapsed()}"
@@ -1182,7 +1207,8 @@ async def _disconnect_guard(
         #   anext_task.cancel() → CancelledError in stream_outputs()
         #   → finally block → abort_request() → request removed from scheduler
         logger.info(
-            f"[disconnect_guard] CLEANUP done, {chunk_count} chunks total, elapsed={_elapsed()}"
+            f"[disconnect_guard] CLEANUP done, {chunk_count} chunks, "
+            f"{heartbeat_count} heartbeats, elapsed={_elapsed()}"
         )
 
 
@@ -1654,8 +1680,19 @@ async def create_anthropic_message(
     """
     engine = get_engine()
 
-    # Parse the raw body to handle Anthropic request format
-    body = await request.json()
+    # Parse the raw body to handle Anthropic request format.
+    # Some clients (e.g. Claude Code) may send JSON with invalid escape
+    # sequences like \s, \d in regex patterns within tool definitions.
+    # Python's json.loads is strict per RFC 8259 and rejects these.
+    try:
+        body = await request.json()
+    except json.JSONDecodeError as e:
+        if "Invalid \\escape" in str(e):
+            raw = await request.body()
+            # Replace lone backslashes (not valid JSON escapes) with \\
+            body = json.loads(re.sub(rb'\\(?!["\\/bfnrtu])', rb"\\\\", raw))
+        else:
+            raise
     anthropic_request = AnthropicRequest(**body)
 
     _validate_model_name(anthropic_request.model)
@@ -1939,6 +1976,27 @@ async def _stream_anthropic_messages(
     accumulated_text = ""
     completion_tokens = 0
 
+    # Tool call streaming suppression — prevents raw tool markup from leaking
+    # as text_delta events. Mirrors the OpenAI streaming path logic.
+    global _tool_parser_instance
+    tool_parser = None
+    tool_accumulated_text = ""
+    tool_markup_possible = False
+    tool_choice = getattr(openai_request, "tool_choice", None)
+    if _enable_auto_tool_choice and _tool_call_parser and tool_choice != "none":
+        if _tool_parser_instance is None:
+            try:
+                parser_cls = ToolParserManager.get_tool_parser(_tool_call_parser)
+                tokenizer = None
+                if _engine is not None and hasattr(_engine, "_tokenizer"):
+                    tokenizer = _engine._tokenizer
+                _tool_parser_instance = parser_cls(tokenizer)
+            except Exception:
+                pass
+        if _tool_parser_instance is not None:
+            tool_parser = _tool_parser_instance
+            tool_parser.reset()
+
     async for output in engine.stream_chat(messages=messages, **chat_kwargs):
         delta_text = output.new_text
 
@@ -1957,7 +2015,30 @@ async def _stream_anthropic_messages(
         if not use_reasoning:
             # Simple path — no reasoning parsing
             accumulated_text += filtered
-            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': filtered}})}\n\n"
+            content_to_emit = filtered
+
+            # Filter tool call markup during streaming
+            if tool_parser and content_to_emit:
+                if not tool_markup_possible and "<" not in content_to_emit:
+                    tool_accumulated_text += content_to_emit
+                else:
+                    if not tool_markup_possible:
+                        tool_markup_possible = True
+                    tool_previous = tool_accumulated_text
+                    tool_accumulated_text += content_to_emit
+                    tool_result = tool_parser.extract_tool_calls_streaming(
+                        tool_previous, tool_accumulated_text, content_to_emit
+                    )
+                    if tool_result is None or "tool_calls" in tool_result:
+                        # Inside tool markup or tool calls detected — suppress
+                        continue
+                    content_to_emit = tool_result.get("content", "")
+                    if content_to_emit:
+                        content_to_emit = _TOOL_MARKUP_PATTERN.sub("", content_to_emit)
+                    if not content_to_emit:
+                        continue
+
+            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': content_to_emit}})}\n\n"
             continue
 
         # Reasoning parser path
@@ -1977,6 +2058,29 @@ async def _stream_anthropic_messages(
             yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': thinking_index, 'delta': {'type': 'thinking_delta', 'thinking': delta_msg.reasoning}})}\n\n"
 
         if delta_msg.content:
+            content_to_emit = delta_msg.content
+
+            # Filter tool call markup during streaming
+            if tool_parser and content_to_emit:
+                if not tool_markup_possible and "<" not in content_to_emit:
+                    tool_accumulated_text += content_to_emit
+                else:
+                    if not tool_markup_possible:
+                        tool_markup_possible = True
+                    tool_previous = tool_accumulated_text
+                    tool_accumulated_text += content_to_emit
+                    tool_result = tool_parser.extract_tool_calls_streaming(
+                        tool_previous, tool_accumulated_text, content_to_emit
+                    )
+                    if tool_result is None or "tool_calls" in tool_result:
+                        # Inside tool markup or tool calls detected — suppress
+                        continue
+                    content_to_emit = tool_result.get("content", "")
+                    if content_to_emit:
+                        content_to_emit = _TOOL_MARKUP_PATTERN.sub("", content_to_emit)
+                    if not content_to_emit:
+                        continue
+
             if thinking_block_started and not text_block_started:
                 # Close thinking block, open text block
                 yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': thinking_index})}\n\n"
@@ -1987,7 +2091,7 @@ async def _stream_anthropic_messages(
                 text_index = 0
                 yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': text_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
                 text_block_started = True
-            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': text_index, 'delta': {'type': 'text_delta', 'text': delta_msg.content}})}\n\n"
+            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': text_index, 'delta': {'type': 'text_delta', 'text': content_to_emit}})}\n\n"
 
     # Close any open thinking block that was never followed by text
     if thinking_block_started and not text_block_started:

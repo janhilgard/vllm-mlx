@@ -1102,11 +1102,7 @@ class Scheduler:
     def _get_detokenizer(self, request_id: str) -> Any:
         """Get or create a streaming detokenizer for a request."""
         if request_id not in self._detokenizer_pool:
-            if hasattr(self.tokenizer, "detokenizer"):
-                detok = self.tokenizer.detokenizer
-            else:
-                detok = NaiveStreamingDetokenizer(self._actual_tokenizer)
-            detok.reset()
+            detok = NaiveStreamingDetokenizer(self._actual_tokenizer)
             self._detokenizer_pool[request_id] = detok
         return self._detokenizer_pool[request_id]
 

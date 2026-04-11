@@ -232,6 +232,11 @@ class BatchedEngine(BaseEngine):
             self._scheduler_config.enable_mtp if self._scheduler_config else False
         )
         mtp_num_draft = getattr(self._scheduler_config, "mtp_num_draft_tokens", 1)
+        kv_quant = getattr(self._scheduler_config, "kv_cache_quantization", False)
+        kv_bits = getattr(self._scheduler_config, "kv_cache_quantization_bits", 8)
+        kv_group_size = getattr(
+            self._scheduler_config, "kv_cache_quantization_group_size", 64
+        )
         mllm_config = MLLMSchedulerConfig(
             max_num_seqs=max_num_seqs,
             prefill_batch_size=prefill_batch_size,
@@ -241,6 +246,9 @@ class BatchedEngine(BaseEngine):
             cache_memory_mb=cache_memory_mb,
             enable_mtp=enable_mtp,
             mtp_num_draft_tokens=mtp_num_draft,
+            kv_cache_quantization=kv_quant,
+            kv_cache_quantization_bits=kv_bits,
+            kv_cache_quantization_group_size=kv_group_size,
         )
 
         # Create and start MLLM scheduler
@@ -537,6 +545,9 @@ class BatchedEngine(BaseEngine):
                 max_tokens=max_tokens,
                 temperature=temperature,
                 top_p=top_p,
+                top_k=kwargs.pop("top_k", 0),
+                min_p=kwargs.pop("min_p", 0.0),
+                presence_penalty=kwargs.pop("presence_penalty", 0.0),
                 repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
             )
 
@@ -554,6 +565,9 @@ class BatchedEngine(BaseEngine):
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
+            top_k=kwargs.pop("top_k", 0),
+            min_p=kwargs.pop("min_p", 0.0),
+            presence_penalty=kwargs.pop("presence_penalty", 0.0),
             repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
             stop=stop or [],
         )
@@ -611,6 +625,9 @@ class BatchedEngine(BaseEngine):
                 max_tokens=max_tokens,
                 temperature=temperature,
                 top_p=top_p,
+                top_k=kwargs.pop("top_k", 0),
+                min_p=kwargs.pop("min_p", 0.0),
+                presence_penalty=kwargs.pop("presence_penalty", 0.0),
                 repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
             )
 
@@ -632,6 +649,9 @@ class BatchedEngine(BaseEngine):
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
+            top_k=kwargs.pop("top_k", 0),
+            min_p=kwargs.pop("min_p", 0.0),
+            presence_penalty=kwargs.pop("presence_penalty", 0.0),
             repetition_penalty=kwargs.pop("repetition_penalty", 1.0),
             stop=stop or [],
         )
@@ -889,12 +909,20 @@ class BatchedEngine(BaseEngine):
 
     def save_cache_to_disk(self, cache_dir: str) -> bool:
         """Save prefix cache to disk for persistence across restarts."""
+        if self._mllm_scheduler and self._mllm_scheduler.batch_generator:
+            pc = self._mllm_scheduler.batch_generator.prefix_cache
+            if pc is not None:
+                return pc.save_to_disk(cache_dir)
         if self._engine:
             return self._engine.save_cache_to_disk(cache_dir)
         return False
 
     def load_cache_from_disk(self, cache_dir: str) -> int:
         """Load prefix cache from disk. Returns number of entries loaded."""
+        if self._mllm_scheduler and self._mllm_scheduler.batch_generator:
+            pc = self._mllm_scheduler.batch_generator.prefix_cache
+            if pc is not None:
+                return pc.load_from_disk(cache_dir)
         if self._engine:
             return self._engine.load_cache_from_disk(cache_dir)
         return 0

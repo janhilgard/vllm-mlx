@@ -74,6 +74,10 @@ class MLLMSchedulerConfig:
     enable_prefix_cache: bool = True
     # Memory limit for prefix cache (None = auto-detect)
     prefix_cache_memory_mb: Optional[int] = None
+    # KV cache quantization for prefix cache store/fetch
+    kv_cache_quantization: bool = False
+    kv_cache_quantization_bits: int = 8
+    kv_cache_quantization_group_size: int = 64
 
 
 @dataclass
@@ -281,10 +285,16 @@ class MLLMScheduler:
             sampler = make_sampler(temp=0.7, top_p=0.9)
 
             # Configure KV prefix cache for text-only requests
+            # KV cache quantization reduces prefix cache memory ~4x (BF16→Q8).
+            # Quantization happens on store(), dequantization on fetch() —
+            # the model always receives normal KVCache with plain arrays.
             prefix_cache_config = None
             if self.config.enable_prefix_cache:
                 prefix_cache_config = MemoryCacheConfig(
                     max_memory_mb=self.config.prefix_cache_memory_mb,
+                    kv_quantize=self.config.kv_cache_quantization,
+                    kv_bits=self.config.kv_cache_quantization_bits,
+                    kv_group_size=self.config.kv_cache_quantization_group_size,
                 )
 
             self.batch_generator = MLLMBatchGenerator(
@@ -362,6 +372,19 @@ class MLLMScheduler:
             sampling_params=sampling_params,
         )
 
+        # Estimate prompt token count for monitoring (text tokens only;
+        # vision tokens are added during prefill but this gives a useful
+        # approximation for the status endpoint).
+        tokenizer = (
+            self.processor.tokenizer
+            if hasattr(self.processor, "tokenizer")
+            else self.processor
+        )
+        try:
+            request.num_prompt_tokens = len(tokenizer.encode(prompt))
+        except Exception:
+            pass
+
         self.requests[request_id] = request
         self.waiting.append(request)
 
@@ -385,6 +408,12 @@ class MLLMScheduler:
         request = self.requests.get(request_id)
         if request is None:
             return False
+
+        # Signal batch generator to abort any in-progress prefill for this
+        # request.  The prefill loop checks _aborted_request_ids between
+        # chunks and raises PrefillAbortedError to exit early.
+        if self.batch_generator is not None:
+            self.batch_generator.abort_prefill(request_id)
 
         # Remove from waiting queue
         if request.status == RequestStatus.WAITING:
@@ -937,7 +966,14 @@ class MLLMScheduler:
                     tok_s = round(n_out / gen_elapsed, 1)
 
             max_tokens = req.sampling_params.max_tokens
-            progress = round(n_out / max_tokens, 3) if max_tokens > 0 else 0.0
+            if phase == "prefill" and self.batch_generator is not None:
+                pp = self.batch_generator.get_prefill_progress(req.request_id)
+                if pp is not None:
+                    progress = round(pp[0] / pp[1], 3) if pp[1] > 0 else 0.0
+                else:
+                    progress = 0.0
+            else:
+                progress = round(n_out / max_tokens, 3) if max_tokens > 0 else 0.0
 
             result.append(
                 {

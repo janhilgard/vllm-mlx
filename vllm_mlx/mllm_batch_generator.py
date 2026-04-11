@@ -31,6 +31,14 @@ from .vision_embedding_cache import VisionEmbeddingCache
 logger = logging.getLogger(__name__)
 
 
+class PrefillAbortedError(Exception):
+    """Raised when a prefill is aborted due to client disconnect."""
+
+    def __init__(self, request_id: str):
+        self.request_id = request_id
+        super().__init__(f"Prefill aborted for request {request_id}")
+
+
 @dataclass
 class MLLMBatchRequest:
     """
@@ -48,6 +56,9 @@ class MLLMBatchRequest:
     max_tokens: int = 256
     temperature: float = 0.7
     top_p: float = 0.9
+    top_k: int = 0
+    min_p: float = 0.0
+    presence_penalty: float = 0.0
     repetition_penalty: float = 1.0
 
     # Processed inputs (set after vision preprocessing)
@@ -104,6 +115,7 @@ class MLLMBatch:
     cache: List[Any]  # BatchKVCache for language model
     requests: List[MLLMBatchRequest]  # Full request data
     logits_processors: Optional[List[Optional[List[Callable]]]] = None
+    samplers: Optional[List[Optional[Callable]]] = None
 
     def __len__(self) -> int:
         return len(self.uids)
@@ -123,6 +135,8 @@ class MLLMBatch:
         self.requests = [self.requests[k] for k in keep_idx]
         if self.logits_processors is not None:
             self.logits_processors = [self.logits_processors[k] for k in keep_idx]
+        if self.samplers is not None:
+            self.samplers = [self.samplers[k] for k in keep_idx]
 
         keep_idx_array = mx.array(keep_idx, mx.int32)
         self.y = self.y[keep_idx_array]
@@ -155,6 +169,13 @@ class MLLMBatch:
             other_lp = other.logits_processors or [None] * len(other.uids)
             self.logits_processors = list(self_lp) + list(other_lp)
 
+        # Extend samplers
+        if self.samplers is not None or other.samplers is not None:
+            self_len = len(self.uids) - len(other.uids)
+            self_s = self.samplers or [None] * self_len
+            other_s = other.samplers or [None] * len(other.uids)
+            self.samplers = list(self_s) + list(other_s)
+
         # Extend cache - handle both BatchKVCache (.keys/.values) and
         # ArraysCache (.cache list) from hybrid models like Qwen3.5
         for c, o in zip(self.cache, other.cache):
@@ -169,15 +190,44 @@ class MLLMBatch:
 
     def extract_cache(self, idx: int) -> List[Any]:
         """
-        Extract cache for a single request (for caching).
+        Extract cache for a single request (for prefix caching).
 
-        Args:
-            idx: Index of request in batch
-
-        Returns:
-            Cache state for that request
+        Handles BatchRotatingKVCache negative left_padding bug:
+        during generation with rotation, left_padding becomes negative,
+        causing extract() to use Python negative indexing and truncate
+        the buffer to only generation tokens instead of the full window.
         """
-        return [c.extract(idx) if hasattr(c, "extract") else None for c in self.cache]
+        from mlx_lm.models.cache import (
+            BatchRotatingKVCache,
+            RotatingKVCache,
+        )
+
+        result = []
+        for c in self.cache:
+            if not hasattr(c, "extract"):
+                result.append(None)
+            elif isinstance(c, BatchRotatingKVCache):
+                # Custom extraction: clamp left_padding to >= 0
+                cache = RotatingKVCache(c.max_size)
+                padding = max(0, c.left_padding[idx].item())
+                offset = c.offset[idx].item()
+                cache.keys = c.keys[idx : idx + 1]
+                cache.values = c.values[idx : idx + 1]
+                cache._idx = c._idx
+                if c.rotated:
+                    cache.keys = mx.roll(cache.keys, -c._idx, axis=2)
+                    cache.values = mx.roll(cache.values, -c._idx, axis=2)
+                    cache._idx = c.max_size
+                cache.keys = mx.contiguous(cache.keys[:, :, padding : cache._idx])
+                cache.values = mx.contiguous(cache.values[:, :, padding : cache._idx])
+                cache.offset = offset
+                cache._idx = cache.keys.shape[2]
+                cache.step = getattr(c, "step", c.max_size)
+                cache.keep = getattr(c, "keep", 0)
+                result.append(cache)
+            else:
+                result.append(c.extract(idx))
+        return result
 
 
 class MLLMBatchStats:
@@ -216,38 +266,6 @@ class MLLMBatchStats:
             "num_images_processed": self.num_images_processed,
             "peak_memory": self.peak_memory,
         }
-
-
-def _make_batch_cache(model: nn.Module, left_padding: List[int]) -> List[Any]:
-    """
-    Create batch-aware cache for the language model.
-
-    Supports both KVCache (standard attention) and ArraysCache (hybrid
-    models like Qwen3.5 with GatedDeltaNet + attention layers).
-
-    Args:
-        model: The language model (model.language_model from VLM)
-        left_padding: Padding amounts for left-padded prompts
-
-    Returns:
-        List of batch cache objects for each layer
-    """
-    from mlx_lm.models.cache import ArraysCache, BatchKVCache, KVCache
-
-    def to_batch_cache(c):
-        if isinstance(c, KVCache):
-            return BatchKVCache(left_padding)
-        elif isinstance(c, ArraysCache):
-            # ArraysCache supports batching natively via merge/filter/extend
-            return c
-        else:
-            raise ValueError(f"{type(c)} does not yet support batching")
-
-    if hasattr(model, "make_cache"):
-        cache = model.make_cache()
-        return [to_batch_cache(c) for c in cache]
-    else:
-        return [BatchKVCache(left_padding) for _ in model.layers]
 
 
 def _left_pad_prompts(
@@ -371,6 +389,15 @@ class MLLMBatchGenerator:
         # Error responses for requests that failed during preprocessing
         self._pending_error_responses: List[MLLMBatchResponse] = []
 
+        # Per-request prefill progress: request_id → (processed_tokens, total_tokens)
+        self._prefill_progress: Dict[str, Tuple[int, int]] = {}
+
+        # Aborted request IDs — checked between prefill chunks to allow
+        # early termination when a client disconnects during long prefill.
+        # Set operations are GIL-protected, safe across event-loop and
+        # executor threads.
+        self._aborted_request_ids: set = set()
+
         # Vision embedding cache for repeated images
         self.vision_cache = VisionEmbeddingCache(
             max_pixel_entries=vision_cache_size,
@@ -391,6 +418,24 @@ class MLLMBatchGenerator:
             )
             logger.info("MLLMBatchGenerator: KV prefix cache enabled")
 
+        # Normalize chat template for prefix-cache stability.
+        # Qwen3.5 chat template retroactively changes formatting of earlier
+        # assistant messages based on last_query_index (position of last
+        # non-tool user message).  When a user text message is appended,
+        # last_query_index jumps forward, removing <think> blocks from
+        # earlier assistant turns — shifting tokens mid-sequence and
+        # breaking prefix match.  Fix: always use plain format for
+        # historical assistant turns (thinking is still added by the
+        # generation prompt at the end).
+        self._normalize_chat_template_for_prefix_cache()
+
+        # Compute think-suffix length for prefix cache key stripping.
+        # Models with enable_thinking=True add <think>\n to the generation
+        # prompt.  This breaks prefix cache (stored key ends with <think>
+        # but next request has actual response at that position).
+        # Stripping the suffix from cache keys enables clean PREFIX match.
+        self._think_suffix_len = self._compute_think_suffix_len()
+
         # Generation stream
         if MLLMBatchGenerator._stream is None:
             MLLMBatchGenerator._stream = mx.new_stream(mx.default_device())
@@ -402,12 +447,157 @@ class MLLMBatchGenerator:
                 mx.device_info()["max_recommended_working_set_size"]
             )
 
+    def _normalize_chat_template_for_prefix_cache(self) -> None:
+        """Patch chat template so historical assistant turns are prefix-stable.
+
+        Qwen3.5's chat template computes ``last_query_index`` — the position
+        of the last non-tool-response user message — and conditionally wraps
+        assistant turns after that index in ``<think>...\\n</think>\\n\\n``.
+        When a new user text message is appended, ``last_query_index`` jumps
+        forward, retroactively removing these ``<think>`` wrappers from
+        earlier assistant turns.  This shifts tokens mid-sequence and breaks
+        prefix cache.
+
+        Fix: replace the conditional with the plain (ELSE) branch so ALL
+        historical assistant messages use ``<|im_start|>assistant\\ncontent``
+        without any injected ``<think>`` block.  The generation prompt still
+        adds ``<think>\\n`` at the very end, so the model generates thinking.
+        """
+        if self.prefix_cache is None:
+            return  # No prefix cache — no need to normalize
+
+        # Find the chat template.  VLM processors (e.g. Qwen3VLProcessor)
+        # keep a SEPARATE copy of chat_template from their tokenizer — both
+        # must be patched.  The processor's copy is used by
+        # BatchedEngine._apply_chat_template() (text rendering), while the
+        # tokenizer's copy is used by _compute_think_suffix_len().
+        tokenizer = getattr(self.processor, "tokenizer", self.processor)
+        # Prefer the processor's own template (it's the one used for rendering)
+        template = getattr(self.processor, "chat_template", None)
+        if not template:
+            template = getattr(tokenizer, "chat_template", None)
+        if not template or "last_query_index" not in template:
+            return  # Not affected
+
+        import re
+
+        # The pattern in Qwen3.5 template:
+        #   {%- if loop.index0 > ns.last_query_index %}
+        #       {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content + '\n</think>\n\n' + content }}
+        #   {%- else %}
+        #       {{- '<|im_start|>' + message.role + '\n' + content }}
+        #   {%- endif %}
+        #
+        # Replace with just the ELSE branch (always plain format).
+        pattern = (
+            r"\{%-\s*if\s+loop\.index0\s*>\s*ns\.last_query_index\s*%\}"
+            r".*?"
+            r"\{%-\s*else\s*%\}"
+            r"\s*(\{\{-.*?content.*?\}\})"
+            r"\s*\{%-\s*endif\s*%\}"
+        )
+        new_template = re.sub(pattern, r"\1", template, flags=re.DOTALL)
+        if new_template != template:
+            # Patch ALL copies: processor, tokenizer, and any dict variants.
+            if hasattr(self.processor, "chat_template"):
+                self.processor.chat_template = new_template
+            tokenizer.chat_template = new_template
+            logger.info(
+                "[prefix_cache] Normalized chat template: removed "
+                "last_query_index conditional for prefix-stable assistant turns"
+            )
+        else:
+            logger.debug(
+                "[prefix_cache] Chat template has last_query_index but "
+                "regex did not match — template may use a different pattern"
+            )
+
+    def _compute_think_suffix_len(self) -> int:
+        """Compute how many extra tokens enable_thinking=True adds at the END.
+
+        Compares the generation prompt suffix with and without
+        ``enable_thinking`` to find the think-tag suffix length
+        (typically ``<think>\\n`` = 2 tokens for Qwen3/Qwen3.5).
+
+        Returns 0 if the template doesn't support ``enable_thinking``.
+        """
+        try:
+            # Find something with apply_chat_template
+            applicator = None
+            for candidate in [
+                getattr(self.processor, "tokenizer", None),
+                self.processor,
+            ]:
+                if candidate is not None and hasattr(candidate, "apply_chat_template"):
+                    applicator = candidate
+                    break
+
+            if applicator is None:
+                logger.warning("[think_suffix] No apply_chat_template found")
+                return 0
+
+            dummy = [{"role": "user", "content": "x"}]
+
+            try:
+                text_with = applicator.apply_chat_template(
+                    dummy,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=True,
+                )
+                text_without = applicator.apply_chat_template(
+                    dummy,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=False,
+                )
+            except TypeError as e:
+                logger.warning(
+                    f"[think_suffix] Template doesn't support enable_thinking: {e}"
+                )
+                return 0
+
+            # Check if enable_thinking adds a known think tag at the end.
+            # enable_thinking may also change the system prompt, so we can't
+            # simply compare lengths — we look at the ending instead.
+            for tag in ["<think>\n", "<think>"]:
+                if text_with.endswith(tag) and not text_without.endswith(tag):
+                    tokenizer = getattr(self.processor, "tokenizer", self.processor)
+                    suffix_tokens = tokenizer.encode(tag)
+                    # encode may add BOS — compare with encoding of empty/short
+                    base_tokens = tokenizer.encode("")
+                    suffix_len = len(suffix_tokens) - len(base_tokens)
+                    logger.info(
+                        f"[think_suffix] Detected think tag '{tag.strip()}' = "
+                        f"{suffix_len} token(s) (ids={suffix_tokens[-suffix_len:] if suffix_len > 0 else []})"
+                    )
+                    return max(0, suffix_len)
+
+            logger.warning(
+                f"[think_suffix] No known think tag at end. "
+                f"with_end='{text_with[-40:]}' without_end='{text_without[-40:]}'"
+            )
+            return 0
+        except Exception as e:
+            logger.warning(f"[think_suffix] Failed to compute: {e}")
+            return 0
+
     def close(self) -> None:
         """Release resources and reset wired limit."""
         if self._old_wired_limit is not None:
             mx.synchronize(MLLMBatchGenerator._stream)
             mx.set_wired_limit(self._old_wired_limit)
             self._old_wired_limit = None
+
+    def abort_prefill(self, request_id: str) -> None:
+        """Signal that a request's prefill should be aborted.
+
+        Called from the event loop thread when a client disconnects.
+        The prefill loop checks this set between chunks and raises
+        PrefillAbortedError to exit early.
+        """
+        self._aborted_request_ids.add(request_id)
+        logger.info(f"[abort_prefill] Marked {request_id} for prefill abort")
 
     def __del__(self):
         try:
@@ -594,6 +784,72 @@ class MLLMBatchGenerator:
             f"({processing_time:.2f}s)"
         )
 
+    def _run_chunked_text_prefill(
+        self, request: MLLMBatchRequest, cache: List[Any]
+    ) -> mx.array:
+        """
+        Run prefill in chunks for text-only requests, reporting real progress.
+
+        Processes input_ids in prefill_step_size chunks through the language
+        model, updating ``_prefill_progress`` after each chunk so the status
+        endpoint can report accurate prefill percentage.
+
+        Returns:
+            Logits from the last chunk (same contract as _run_vision_encoding).
+        """
+        input_ids = request.input_ids
+        if input_ids.ndim == 1:
+            input_ids = input_ids[None, :]
+
+        total = input_ids.shape[1]
+        step = self.prefill_step_size
+
+        # Short prompt — process in one shot (no chunking overhead)
+        if total <= step:
+            self._prefill_progress[request.request_id] = (total, total)
+            output = self.language_model(input_ids, cache=cache)
+            request.vision_encoded = True
+            if hasattr(output, "logits"):
+                return output.logits
+            return output
+
+        # Process all chunks except the last
+        processed = 0
+        chunk_count = 0
+        while processed + step < total:
+            # Check for abort between chunks (client disconnect)
+            if request.request_id in self._aborted_request_ids:
+                self._aborted_request_ids.discard(request.request_id)
+                logger.info(
+                    f"[chunked_prefill] Aborted {request.request_id} at "
+                    f"{processed}/{total} tokens"
+                )
+                raise PrefillAbortedError(request.request_id)
+
+            chunk = input_ids[:, processed : processed + step]
+            self.language_model(chunk, cache=cache)
+            mx.eval([c.state for c in cache])
+            processed += step
+            chunk_count += 1
+            self._prefill_progress[request.request_id] = (processed, total)
+
+            # Release Metal buffer pool periodically.  Full-attention layers
+            # produce attention score buffers that grow each chunk (1024 ×
+            # growing_context).  Old smaller buffers can't be reused, so the
+            # pool accumulates O(N²) memory without clearing.
+            if chunk_count % 4 == 0:
+                mx.clear_cache()
+
+        # Last chunk — return logits for sampling
+        last_chunk = input_ids[:, processed:]
+        output = self.language_model(last_chunk, cache=cache)
+        request.vision_encoded = True
+        self._prefill_progress[request.request_id] = (total, total)
+
+        if hasattr(output, "logits"):
+            return output.logits
+        return output
+
     def _run_vision_encoding(
         self, request: MLLMBatchRequest, cache: Optional[List[Any]] = None
     ) -> mx.array:
@@ -713,95 +969,206 @@ class MLLMBatchGenerator:
         all_logprobs = []
         per_request_caches = []
 
+        aborted_requests = []
         for req in requests:
-            # Try prefix cache for text-only requests
-            cached_kv = None
-            remaining_ids = None
-            if (
-                self.prefix_cache is not None
-                and req.is_text_only
-                and req.input_ids is not None
-            ):
-                input_ids_list = req.input_ids.reshape(-1).tolist()
-                cached_kv, remaining_ids = self.prefix_cache.fetch(input_ids_list)
+            try:
+                # Check abort before starting prefill
+                if req.request_id in self._aborted_request_ids:
+                    self._aborted_request_ids.discard(req.request_id)
+                    raise PrefillAbortedError(req.request_id)
 
-            if cached_kv is not None and remaining_ids:
-                # Prefix/LCP match — run language model on remaining tokens
-                request_cache = cached_kv
-                remaining = mx.array(remaining_ids)[None, :]
+                # Try prefix cache for all requests (text-only and multimodal).
+                # VLM forward writes the same KV state as language model forward
+                # for text tokens, so cached KV from a previous VLM run is valid.
+                # However, if the remaining (uncached) tokens contain image
+                # placeholders, we must fall back to VLM forward instead of
+                # running them through the language model alone.
+                cached_kv = None
+                remaining_ids = None
+                if self.prefix_cache is not None and req.input_ids is not None:
+                    input_ids_list = req.input_ids.reshape(-1).tolist()
+                    # Strip think suffix from lookup key so stored entries
+                    # (also stripped) match as clean PREFIX.
+                    S = self._think_suffix_len
+                    lookup_ids = input_ids_list[:-S] if S > 0 else input_ids_list
+                    cached_kv, remaining_ids = self.prefix_cache.fetch(lookup_ids)
+                    # Append think suffix back to remaining so the model
+                    # sees the full generation prompt (<think>\n).
+                    if cached_kv is not None and S > 0:
+                        remaining_ids = list(remaining_ids) + input_ids_list[-S:]
 
-                with mx.stream(MLLMBatchGenerator._stream):
-                    logits = self.language_model(remaining, cache=request_cache)
-                    if hasattr(logits, "logits"):
-                        logits = logits.logits
+                    # If remaining tokens contain image placeholders, the
+                    # language-model-only path cannot handle them — clear the
+                    # cache hit so we fall through to full VLM forward.
+                    if cached_kv is not None and remaining_ids:
+                        img_tok = getattr(
+                            getattr(self.model, "config", None),
+                            "image_token_index",
+                            None,
+                        )
+                        if img_tok is not None and img_tok in remaining_ids:
+                            cached_kv = None
+                            remaining_ids = None
 
-                    last_logits = logits[:, -1, :]
-                    logprobs = last_logits - mx.logsumexp(
-                        last_logits, axis=-1, keepdims=True
+                if cached_kv is not None and remaining_ids:
+                    # Prefix/LCP match — run language model on remaining tokens
+                    request_cache = cached_kv
+                    remaining = mx.array(remaining_ids)[None, :]
+                    cached_count = len(input_ids_list) - len(remaining_ids)
+                    total_tokens = len(input_ids_list)
+                    remaining_count = len(remaining_ids)
+
+                    with mx.stream(MLLMBatchGenerator._stream):
+                        step = self.prefill_step_size
+                        if remaining_count <= step:
+                            # Short remaining — process in one shot
+                            self._prefill_progress[req.request_id] = (
+                                total_tokens,
+                                total_tokens,
+                            )
+                            logits = self.language_model(remaining, cache=request_cache)
+                        else:
+                            # Chunked prefill on remaining tokens
+                            self._prefill_progress[req.request_id] = (
+                                cached_count,
+                                total_tokens,
+                            )
+                            processed = 0
+                            chunk_count = 0
+                            while processed + step < remaining_count:
+                                # Check for abort between chunks
+                                if req.request_id in self._aborted_request_ids:
+                                    self._aborted_request_ids.discard(req.request_id)
+                                    logger.info(
+                                        f"[chunked_prefill] Aborted {req.request_id} "
+                                        f"at {cached_count + processed}/{total_tokens} tokens"
+                                    )
+                                    raise PrefillAbortedError(req.request_id)
+
+                                chunk = remaining[:, processed : processed + step]
+                                self.language_model(chunk, cache=request_cache)
+                                mx.eval([c.state for c in request_cache])
+                                processed += step
+                                chunk_count += 1
+                                self._prefill_progress[req.request_id] = (
+                                    cached_count + processed,
+                                    total_tokens,
+                                )
+                                if chunk_count % 4 == 0:
+                                    mx.clear_cache()
+                            # Last chunk — return logits
+                            remaining = remaining[:, processed:]
+                            logits = self.language_model(remaining, cache=request_cache)
+                            self._prefill_progress[req.request_id] = (
+                                total_tokens,
+                                total_tokens,
+                            )
+
+                        if hasattr(logits, "logits"):
+                            logits = logits.logits
+
+                        last_logits = logits[:, -1, :]
+                        logprobs = last_logits - mx.logsumexp(
+                            last_logits, axis=-1, keepdims=True
+                        )
+                        sampled = self.sampler(logprobs)
+                        mx.eval(sampled, logprobs)
+
+                        first_tokens.append(sampled.item())
+                        all_logprobs.append(logprobs.squeeze(0))
+
+                    per_request_caches.append(request_cache)
+                    req.vision_encoded = True
+                    logger.debug(
+                        f"Prefix cache hit for {req.request_id}: "
+                        f"cached={cached_count}, "
+                        f"remaining={remaining_count}"
                     )
-                    sampled = self.sampler(logprobs)
-                    mx.eval(sampled, logprobs)
 
-                    first_tokens.append(sampled.item())
-                    all_logprobs.append(logprobs.squeeze(0))
+                elif cached_kv is not None and not remaining_ids:
+                    # Exact/supersequence match — cache has all tokens,
+                    # but we still need logits for the last token.
+                    # fetch() with trim-by-1 store always returns remaining=[last_token].
+                    # If we get here (empty remaining), re-run on last token.
+                    request_cache = cached_kv
+                    last_token = req.input_ids[:, -1:]
+                    total_tokens = len(input_ids_list)
+                    self._prefill_progress[req.request_id] = (
+                        total_tokens,
+                        total_tokens,
+                    )
 
-                per_request_caches.append(request_cache)
-                logger.debug(
-                    f"Prefix cache hit for {req.request_id}: "
-                    f"cached={len(input_ids_list) - len(remaining_ids)}, "
-                    f"remaining={len(remaining_ids)}"
+                    with mx.stream(MLLMBatchGenerator._stream):
+                        logits = self.language_model(last_token, cache=request_cache)
+                        if hasattr(logits, "logits"):
+                            logits = logits.logits
+
+                        last_logits = logits[:, -1, :]
+                        logprobs = last_logits - mx.logsumexp(
+                            last_logits, axis=-1, keepdims=True
+                        )
+                        sampled = self.sampler(logprobs)
+                        mx.eval(sampled, logprobs)
+
+                        first_tokens.append(sampled.item())
+                        all_logprobs.append(logprobs.squeeze(0))
+
+                    per_request_caches.append(request_cache)
+                    req.vision_encoded = True
+                    logger.debug(
+                        f"Prefix cache exact hit for {req.request_id}: "
+                        f"all {total_tokens} tokens cached"
+                    )
+
+                else:
+                    # Cache miss — full forward pass
+                    request_cache = make_prompt_cache(self.language_model)
+
+                    with mx.stream(MLLMBatchGenerator._stream):
+                        # Text-only: chunked prefill with real progress tracking
+                        # Multimodal: atomic VLM forward (vision encoder needs full input)
+                        if req.is_text_only:
+                            logits = self._run_chunked_text_prefill(
+                                req, cache=request_cache
+                            )
+                        else:
+                            logits = self._run_vision_encoding(req, cache=request_cache)
+
+                        # Extract last token logits and sample
+                        last_logits = logits[:, -1, :]
+                        logprobs = last_logits - mx.logsumexp(
+                            last_logits, axis=-1, keepdims=True
+                        )
+                        sampled = self.sampler(logprobs)
+
+                        mx.eval(sampled, logprobs)
+
+                        first_tokens.append(sampled.item())
+                        all_logprobs.append(logprobs.squeeze(0))
+
+                    per_request_caches.append(request_cache)
+
+            except PrefillAbortedError:
+                aborted_requests.append(req)
+                self._prefill_progress.pop(req.request_id, None)
+                self._pending_error_responses.append(
+                    MLLMBatchResponse(
+                        uid=req.uid,
+                        request_id=req.request_id,
+                        token=0,
+                        logprobs=mx.zeros(1),
+                        finish_reason="abort",
+                    )
                 )
 
-            elif cached_kv is not None and not remaining_ids:
-                # Exact/supersequence match — cache has all tokens,
-                # but we still need logits for the last token.
-                # fetch() with trim-by-1 store always returns remaining=[last_token].
-                # If we get here (empty remaining), re-run on last token.
-                request_cache = cached_kv
-                last_token = req.input_ids[:, -1:]
-
-                with mx.stream(MLLMBatchGenerator._stream):
-                    logits = self.language_model(last_token, cache=request_cache)
-                    if hasattr(logits, "logits"):
-                        logits = logits.logits
-
-                    last_logits = logits[:, -1, :]
-                    logprobs = last_logits - mx.logsumexp(
-                        last_logits, axis=-1, keepdims=True
-                    )
-                    sampled = self.sampler(logprobs)
-                    mx.eval(sampled, logprobs)
-
-                    first_tokens.append(sampled.item())
-                    all_logprobs.append(logprobs.squeeze(0))
-
-                per_request_caches.append(request_cache)
-                logger.debug(
-                    f"Prefix cache exact hit for {req.request_id}: "
-                    f"all {len(input_ids_list)} tokens cached"
-                )
-
-            else:
-                # Cache miss — full VLM forward pass
-                request_cache = make_prompt_cache(self.language_model)
-
-                with mx.stream(MLLMBatchGenerator._stream):
-                    # Run VLM forward pass — cache= flows through to language_model
-                    logits = self._run_vision_encoding(req, cache=request_cache)
-
-                    # Extract last token logits and sample
-                    last_logits = logits[:, -1, :]
-                    logprobs = last_logits - mx.logsumexp(
-                        last_logits, axis=-1, keepdims=True
-                    )
-                    sampled = self.sampler(logprobs)
-
-                    mx.eval(sampled, logprobs)
-
-                    first_tokens.append(sampled.item())
-                    all_logprobs.append(logprobs.squeeze(0))
-
-                per_request_caches.append(request_cache)
+        # Remove aborted requests — they have no entries in the parallel
+        # lists (first_tokens, all_logprobs, per_request_caches)
+        if aborted_requests:
+            for req in aborted_requests:
+                requests.remove(req)
+            mx.clear_cache()
+            if not requests:
+                return None
 
         # Merge per-request caches into batched caches.
         # Both KVCache.merge() and ArraysCache.merge() produce batch-aware
@@ -828,6 +1195,22 @@ class MLLMBatchGenerator:
                                 trim_size, layer_cache.values
                             )
                             layer_cache._idx = layer_cache.max_size
+                        # Normalize wrapped rotating cache for merge:
+                        # after rotation _idx wraps around but merge()
+                        # expects _idx == actual buffer size.
+                        # Use keys.shape[2] (actual entries) NOT size()
+                        # which can be inconsistent after prefix cache trim
+                        # (size() = min(offset, max_size) but buffer may
+                        # have fewer entries when trimmed).
+                        actual_buf = layer_cache.keys.shape[2]
+                        if layer_cache._idx != actual_buf and actual_buf > 0:
+                            layer_cache.keys = layer_cache._temporal_order(
+                                layer_cache.keys
+                            )
+                            layer_cache.values = layer_cache._temporal_order(
+                                layer_cache.values
+                            )
+                            layer_cache._idx = actual_buf
 
         try:
             batch_cache = [
@@ -847,22 +1230,50 @@ class MLLMBatchGenerator:
         # Create initial y (first generated tokens)
         y = mx.array(first_tokens)
 
-        # Build per-request logits processors from repetition_penalty
-        from mlx_lm.sample_utils import make_logits_processors
+        # Build per-request logits processors (repetition_penalty, presence_penalty)
+        from mlx_lm.sample_utils import make_logits_processors, make_sampler
 
         batch_logits_processors = []
-        has_any = False
+        has_any_lp = False
         for req in requests:
-            if req.repetition_penalty and req.repetition_penalty != 1.0:
-                lp = make_logits_processors(repetition_penalty=req.repetition_penalty)
+            need_rep = req.repetition_penalty and req.repetition_penalty != 1.0
+            need_pres = req.presence_penalty and req.presence_penalty != 0.0
+            if need_rep or need_pres:
+                lp_kwargs = {}
+                if need_rep:
+                    lp_kwargs["repetition_penalty"] = req.repetition_penalty
+                if need_pres:
+                    lp_kwargs["presence_penalty"] = req.presence_penalty
+                lp = make_logits_processors(**lp_kwargs)
                 batch_logits_processors.append(lp)
-                has_any = True
+                has_any_lp = True
                 logger.info(
-                    f"[rep_penalty] request={req.request_id[:12]} "
-                    f"penalty={req.repetition_penalty}"
+                    f"[sampling] request={req.request_id[:12]} "
+                    f"rep_penalty={req.repetition_penalty} "
+                    f"pres_penalty={req.presence_penalty}"
                 )
             else:
                 batch_logits_processors.append(None)
+
+        # Build per-request samplers for top_k/min_p
+        batch_samplers = []
+        has_any_sampler = False
+        for req in requests:
+            if req.top_k != 0 or req.min_p != 0.0:
+                s = make_sampler(
+                    temp=req.temperature,
+                    top_p=req.top_p,
+                    top_k=req.top_k,
+                    min_p=req.min_p,
+                )
+                batch_samplers.append(s)
+                has_any_sampler = True
+                logger.info(
+                    f"[sampling] request={req.request_id[:12]} "
+                    f"top_k={req.top_k} min_p={req.min_p}"
+                )
+            else:
+                batch_samplers.append(None)
 
         self._stats.prompt_time += time.perf_counter() - tic
 
@@ -875,7 +1286,8 @@ class MLLMBatchGenerator:
             num_tokens=[0] * len(requests),
             cache=batch_cache,
             requests=requests,
-            logits_processors=batch_logits_processors if has_any else None,
+            logits_processors=batch_logits_processors if has_any_lp else None,
+            samplers=batch_samplers if has_any_sampler else None,
         )
 
     def _step(
@@ -884,6 +1296,7 @@ class MLLMBatchGenerator:
         cache: List[Any],
         logits_processors: Optional[List[Optional[List[Callable]]]] = None,
         output_tokens: Optional[List[List[int]]] = None,
+        samplers: Optional[List[Optional[Callable]]] = None,
     ) -> Tuple[mx.array, List[mx.array]]:
         """
         Run one generation step through the language model.
@@ -893,6 +1306,7 @@ class MLLMBatchGenerator:
             cache: BatchKVCache for the language model
             logits_processors: Per-request logits processors (e.g. repetition penalty)
             output_tokens: Per-request generated tokens so far (needed by processors)
+            samplers: Per-request sampler functions (for top_k/min_p)
 
         Returns:
             Tuple of (sampled tokens, logprobs list)
@@ -925,9 +1339,16 @@ class MLLMBatchGenerator:
                 processed_logits.append(sample_logits)
             logits = mx.concatenate(processed_logits, axis=0)
 
-        # Sample
+        # Sample — per-request samplers for top_k/min_p support
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        sampled = self.sampler(logprobs)
+        if samplers and any(samplers):
+            sampled_list = []
+            for e in range(logprobs.shape[0]):
+                s = samplers[e] if samplers[e] else self.sampler
+                sampled_list.append(s(logprobs[e : e + 1]))
+            sampled = mx.concatenate(sampled_list, axis=0)
+        else:
+            sampled = self.sampler(logprobs)
 
         return sampled, list(logprobs)
 
@@ -959,8 +1380,11 @@ class MLLMBatchGenerator:
                 return []
 
             try:
+                # Save count before _process_prompts which modifies
+                # `requests` in-place via .remove() for failed items.
+                num_to_consume = len(requests)
                 new_batch = self._process_prompts(requests)
-                self.unprocessed_requests = self.unprocessed_requests[len(requests) :]
+                self.unprocessed_requests = self.unprocessed_requests[num_to_consume:]
                 self.active_batch = new_batch
                 prompt_processing = True
             except Exception as e:
@@ -991,13 +1415,13 @@ class MLLMBatchGenerator:
 
             if text_only:
                 try:
+                    # Capture UIDs before _process_prompts modifies
+                    # text_only in-place via .remove() for failed items.
+                    all_uids = {r.uid for r in text_only}
                     new_batch = self._process_prompts(text_only)
-                    # Remove processed requests from queue
-                    processed_uids = {r.uid for r in text_only}
+                    # Remove ALL requested (both successful and failed)
                     self.unprocessed_requests = [
-                        r
-                        for r in self.unprocessed_requests
-                        if r.uid not in processed_uids
+                        r for r in self.unprocessed_requests if r.uid not in all_uids
                     ]
                     if new_batch is not None:
                         batch.extend(new_batch)
@@ -1043,7 +1467,11 @@ class MLLMBatchGenerator:
             else None
         )
         batch.y, batch.logprobs = self._step(
-            y[:, None], batch.cache, batch.logits_processors, output_tokens
+            y[:, None],
+            batch.cache,
+            batch.logits_processors,
+            output_tokens,
+            batch.samplers,
         )
         mx.async_eval(batch.y, batch.logprobs)
 
@@ -1090,6 +1518,8 @@ class MLLMBatchGenerator:
             if finish_reason is not None:
                 # Extract cache for this request
                 cache_fn = lambda idx=i: batch.extract_cache(idx)
+                # Cleanup prefill progress tracking
+                self._prefill_progress.pop(request_id, None)
 
             responses.append(
                 MLLMBatchResponse(
@@ -1146,17 +1576,28 @@ class MLLMBatchGenerator:
             return
         for i in end_indices:
             req = batch.requests[i]
-            if req.is_text_only and req.input_ids is not None:
+            if req.input_ids is not None:
                 try:
                     extracted = batch.extract_cache(i)
                     input_ids_list = req.input_ids.reshape(-1).tolist()
                     # Store prompt-only KV (trim output tokens + 1 so next
-                    # fetch returns remaining=[last_prompt_token] at minimum)
+                    # fetch returns remaining=[last_prompt_token] at minimum).
+                    # Also strip think suffix from key so next request's
+                    # (also stripped) key matches as a clean PREFIX.
                     output_count = batch.num_tokens[i]
-                    prompt_cache = _trim_cache_offset(extracted, output_count + 1)
-                    self.prefix_cache.store(input_ids_list, prompt_cache)
+                    S = self._think_suffix_len
+                    total_trim = output_count + 1 + S
+                    prompt_cache = _trim_cache_offset(extracted, total_trim)
+                    cache_key = input_ids_list[:-S] if S > 0 else input_ids_list
+                    self.prefix_cache.store(cache_key, prompt_cache)
                 except Exception as e:
-                    logger.warning(f"[prefix_store] FAILED: {type(e).__name__}: {e}")
+                    logger.warning(
+                        f"Failed to store prefix cache for {req.request_id}: {type(e).__name__}: {e}"
+                    )
+
+    def get_prefill_progress(self, request_id: str) -> Optional[Tuple[int, int]]:
+        """Return (processed_tokens, total_tokens) or None."""
+        return self._prefill_progress.get(request_id)
 
     def get_vision_cache_stats(self) -> Dict[str, Any]:
         """Get vision cache statistics."""
@@ -1221,6 +1662,7 @@ def install_mtp_mllm(
         cache: List[Any],
         logits_processors: Optional[List[Optional[List[Callable]]]] = None,
         output_tokens: Optional[List[List[int]]] = None,
+        samplers: Optional[List[Optional[Callable]]] = None,
     ) -> Tuple[mx.array, List[mx.array]]:
         """Extended _step with MTP always-advance strategy."""
         batch_size = input_tokens.shape[0]
@@ -1234,7 +1676,9 @@ def install_mtp_mllm(
             or len(batch_gen.active_batch) > 1
         ):
             _skip_state[0] = None
-            return _orig_step(input_tokens, cache, logits_processors, output_tokens)
+            return _orig_step(
+                input_tokens, cache, logits_processors, output_tokens, samplers
+            )
 
         # Check skip state
         skip = _skip_state[0]
@@ -1252,7 +1696,9 @@ def install_mtp_mllm(
             if isinstance(model_output, tuple):
                 logits, hidden_states = model_output
             else:
-                return _orig_step(input_tokens, cache, logits_processors, output_tokens)
+                return _orig_step(
+                    input_tokens, cache, logits_processors, output_tokens, samplers
+                )
             logits = logits[:, -1, :]
 
         # Apply logits processors before sampling
@@ -1268,9 +1714,16 @@ def install_mtp_mllm(
                 processed_logits.append(sample_logits)
             logits = mx.concatenate(processed_logits, axis=0)
 
-        # Sample primary
+        # Sample primary (use per-request sampler if available)
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        primary_tokens = batch_gen.sampler(logprobs)
+        if samplers and any(samplers):
+            sampled_list = []
+            for e in range(logprobs.shape[0]):
+                s = samplers[e] if samplers[e] else batch_gen.sampler
+                sampled_list.append(s(logprobs[e : e + 1]))
+            primary_tokens = mx.concatenate(sampled_list, axis=0)
+        else:
+            primary_tokens = batch_gen.sampler(logprobs)
 
         current_uids = list(batch_gen.active_batch.uids)
 
