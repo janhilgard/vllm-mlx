@@ -256,13 +256,27 @@ class SimpleEngine(BaseEngine):
         """
         Generate a complete response (non-streaming).
 
+        Thin accumulator over stream_generate(). stream_generate() is the
+        only code path that consumes per-request SpecPrefill overrides
+        (`specprefill`, `specprefill_keep_pct`) and routes through
+        _stream_generate_specprefill() when engaged. The prior direct
+        self._model.generate() path silently dropped those overrides for
+        non-streaming /v1/completions callers, so extra_body.specprefill
+        was advertised by the server but had no effect on this route.
+
+        By iterating stream_generate() and returning the last
+        GenerationOutput, non-streaming clients get the same SpecPrefill
+        engagement, accurate prompt_tokens reporting, and per-request
+        override support as streaming clients.
+
         Args:
             prompt: Input text
             max_tokens: Maximum tokens to generate
             temperature: Sampling temperature
             top_p: Top-p sampling
             stop: Stop sequences
-            **kwargs: Additional model-specific parameters
+            **kwargs: Additional parameters forwarded to stream_generate,
+                including per-request `specprefill` / `specprefill_keep_pct`
 
         Returns:
             GenerationOutput with complete text
@@ -270,27 +284,28 @@ class SimpleEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
-        output = await self._run_blocking_serialized(
-            self._model.generate,
+        last_output: GenerationOutput | None = None
+        async for output in self.stream_generate(
             prompt=prompt,
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
             stop=stop,
             **kwargs,
-        )
+        ):
+            last_output = output
 
-        # Clean output text
-        text = clean_output_text(output.text)
+        if last_output is None:
+            return GenerationOutput(text="", finish_reason="stop")
 
+        text = clean_output_text(last_output.text)
         return GenerationOutput(
             text=text,
-            tokens=getattr(output, "tokens", []),
-            prompt_tokens=getattr(output, "prompt_tokens", 0),
-            completion_tokens=getattr(
-                output, "completion_tokens", len(getattr(output, "tokens", []))
-            ),
-            finish_reason=output.finish_reason,
+            tokens=list(last_output.tokens),
+            prompt_tokens=last_output.prompt_tokens,
+            completion_tokens=last_output.completion_tokens,
+            finish_reason=last_output.finish_reason,
+            finished=True,
         )
 
     async def stream_generate(
@@ -452,6 +467,32 @@ class SimpleEngine(BaseEngine):
         """
         if not self._loaded:
             await self.start()
+
+        # mlx-lm non-streaming chat with tools can stall indefinitely on some
+        # local models, while the streaming path completes normally. Reuse the
+        # streaming implementation and aggregate its final state so both chat
+        # APIs share the same tool-capable execution path.
+        if tools and not self._is_mllm:
+            final_output = GenerationOutput(text="")
+            async for output in self.stream_chat(
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                tools=tools,
+                images=images,
+                videos=videos,
+                **kwargs,
+            ):
+                final_output = output
+            text = clean_output_text(final_output.text)
+            return GenerationOutput(
+                text=text,
+                tokens=list(final_output.tokens),
+                prompt_tokens=final_output.prompt_tokens,
+                completion_tokens=final_output.completion_tokens,
+                finish_reason=final_output.finish_reason,
+            )
 
         # Convert tools for template if provided
         template_tools = convert_tools_for_template(tools) if tools else None

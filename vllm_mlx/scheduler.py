@@ -62,6 +62,8 @@ class SchedulerConfig:
     prefill_batch_size: int = 8
     completion_batch_size: int = 32
     prefill_step_size: int = 2048
+    # Optional override for MLLM prefill guard (None = use MLLM default).
+    mllm_prefill_step_size: Optional[int] = None
 
     # Prefix cache settings
     enable_prefix_cache: bool = True
@@ -101,6 +103,10 @@ class SchedulerConfig:
     enable_mtp: bool = False
     mtp_num_draft_tokens: int = 1  # Number of draft tokens from MTP head
     mtp_optimistic: bool = False  # Skip acceptance check for max speed
+
+    def __post_init__(self) -> None:
+        if self.mllm_prefill_step_size is not None and self.mllm_prefill_step_size <= 0:
+            raise ValueError("mllm_prefill_step_size must be > 0 when provided")
 
 
 @dataclass
@@ -1257,15 +1263,25 @@ class Scheduler:
             prefill_batch_size=self.config.prefill_batch_size,
             completion_batch_size=self.config.completion_batch_size,
             prefill_step_size=self.config.prefill_step_size,
-            prompt_progress_callback=_prefill_progress,
         )
+        # Set callback as attribute — used by _install_chunked_prefill
+        # monkey-patch. Not a BatchGenerator constructor parameter.
+        bg.prompt_progress_callback = _prefill_progress
 
         # Install chunked prefill when explicitly configured OR when
         # memory-aware cache is active (needed for prefix_boundary saves
         # in agentic multi-turn workloads with hybrid Mamba+Transformer models).
         chunked_budget = self.config.chunked_prefill_tokens
         need_chunked = chunked_budget > 0 or self.memory_aware_cache is not None
-        if need_chunked:
+
+        # The chunked prefill monkey-patch relies on BatchGenerator internals
+        # (_process_prompts, active_batch, _step, etc.) that were refactored
+        # in mlx-lm 0.31.x.  Skip gracefully when the required API is absent.
+        chunked_compatible = hasattr(bg, "_process_prompts") and hasattr(
+            bg, "active_batch"
+        )
+
+        if need_chunked and chunked_compatible:
             if chunked_budget <= 0:
                 # No explicit budget — use a very large value so normal
                 # prompts pass through unchanged.  Prefix boundary splits
@@ -1287,6 +1303,12 @@ class Scheduler:
                 pending_abort_ids=self._pending_abort_ids,
                 uid_to_request_id=self.uid_to_request_id,
                 requests=self.requests,
+            )
+        elif need_chunked and not chunked_compatible:
+            logger.warning(
+                "Chunked prefill disabled: mlx-lm BatchGenerator lacks required "
+                "internals (_process_prompts, active_batch). Upgrade mlx-lm or "
+                "check compatibility."
             )
 
         # Install MTP if the model supports it
@@ -2335,8 +2357,15 @@ class Scheduler:
 
                 # Run generation step if we have running requests
                 if self.batch_generator is not None and self.running:
-                    responses = self.batch_generator.next()
+                    result = self.batch_generator.next()
                     output.has_work = True
+
+                    # mlx-lm >=0.31.x returns (prompt_responses, generation_responses);
+                    # older versions returned a flat list.
+                    if isinstance(result, tuple):
+                        responses = result[1]  # generation_responses only
+                    else:
+                        responses = result
 
                     if responses:
                         outputs, finished_ids = self._process_batch_responses(responses)
@@ -2404,6 +2433,7 @@ class Scheduler:
             # Evaluate batch tokens to collapse lazy concatenation chains
             if (
                 self.batch_generator is not None
+                and hasattr(self.batch_generator, "active_batch")
                 and self.batch_generator.active_batch is not None
                 and hasattr(self.batch_generator.active_batch, "tokens")
             ):

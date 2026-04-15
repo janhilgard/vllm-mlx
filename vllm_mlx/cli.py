@@ -172,6 +172,9 @@ def serve_command(args):
             kv_cache_quantization_bits=args.kv_cache_quantization_bits,
             kv_cache_quantization_group_size=args.kv_cache_quantization_group_size,
             kv_cache_min_quantize_tokens=args.kv_cache_min_quantize_tokens,
+            mllm_prefill_step_size=(
+                args.mllm_prefill_step_size if args.mllm_prefill_step_size > 0 else None
+            ),
         )
 
         print("Mode: Continuous batching (for multiple concurrent users)")
@@ -289,6 +292,7 @@ def bench_command(args):
             kv_cache_quantization_group_size=args.kv_cache_quantization_group_size,
             kv_cache_min_quantize_tokens=args.kv_cache_min_quantize_tokens,
         )
+
         engine_config = EngineConfig(
             model_name=args.model,
             scheduler_config=scheduler_config,
@@ -633,7 +637,8 @@ def bench_kv_cache_command(args):
     )
 
 
-def main():
+def create_parser() -> argparse.ArgumentParser:
+    """Build the top-level CLI parser."""
     parser = argparse.ArgumentParser(
         description="vllm-mlx: Apple Silicon MLX backend for vLLM",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -666,6 +671,12 @@ Examples:
     )
     serve_parser.add_argument(
         "--completion-batch-size", type=int, default=32, help="Completion batch size"
+    )
+    serve_parser.add_argument(
+        "--mllm-prefill-step-size",
+        type=int,
+        default=0,
+        help="Override MLLM prefill-step guard (0=use MLLM default: 1024)",
     )
     serve_parser.add_argument(
         "--enable-prefix-cache",
@@ -880,6 +891,8 @@ Examples:
             "qwen3_coder",
             "llama",
             "hermes",
+            "harmony",
+            "gpt-oss",
             "deepseek",
             "kimi",
             "granite",
@@ -893,7 +906,8 @@ Examples:
         help=(
             "Select the tool call parser for the model. Options: "
             "auto (auto-detect), mistral, qwen, qwen3_coder, llama, hermes, "
-            "deepseek, gemma4, kimi, granite, nemotron, xlam, functionary, glm47, minimax. "
+            "harmony, gpt-oss, deepseek, gemma4, kimi, granite, nemotron, "
+            "xlam, functionary, glm47, minimax. "
             "Required for --enable-auto-tool-choice."
         ),
     )
@@ -1113,6 +1127,12 @@ Examples:
         action="store_true",
         help="Download as multimodal model (broader file patterns)",
     )
+
+    return parser
+
+
+def main():
+    parser = create_parser()
     args = parser.parse_args()
 
     if args.command == "serve":

@@ -168,6 +168,41 @@ class TestCompletionRequest:
         assert request.max_tokens is None  # uses _default_max_tokens when None
 
 
+class TestServeCli:
+    """Test serve CLI argument parsing."""
+
+    def test_tool_call_parser_accepts_harmony_aliases(self):
+        """GPT-OSS/Harmony parsers should be selectable from the serve CLI."""
+        from vllm_mlx.cli import create_parser
+
+        parser = create_parser()
+        args = parser.parse_args(
+            [
+                "serve",
+                "lmstudio-community/gpt-oss-20b-MLX-8bit",
+                "--enable-auto-tool-choice",
+                "--tool-call-parser",
+                "harmony",
+            ]
+        )
+
+        assert args.command == "serve"
+        assert args.tool_call_parser == "harmony"
+        assert args.enable_auto_tool_choice is True
+
+        args = parser.parse_args(
+            [
+                "serve",
+                "lmstudio-community/gpt-oss-20b-MLX-8bit",
+                "--enable-auto-tool-choice",
+                "--tool-call-parser",
+                "gpt-oss",
+            ]
+        )
+
+        assert args.tool_call_parser == "gpt-oss"
+
+
 # =============================================================================
 # Helper Function Tests
 # =============================================================================
@@ -594,9 +629,7 @@ class TestAPIKeyVerification:
 
             # Should raise HTTPException with 401
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.get_event_loop().run_until_complete(
-                    server.verify_api_key(credentials)
-                )
+                asyncio.run(server.verify_api_key(credentials))
 
             assert exc_info.value.status_code == 401
             assert "Invalid API key" in str(exc_info.value.detail)
@@ -622,9 +655,7 @@ class TestAPIKeyVerification:
             )
 
             # Should not raise any exception
-            result = asyncio.get_event_loop().run_until_complete(
-                server.verify_api_key(credentials)
-            )
+            result = asyncio.run(server.verify_api_key(credentials))
             # verify_api_key returns True on success (no exception raised)
             assert result is True or result is None
         finally:
@@ -681,7 +712,7 @@ class TestRateLimiterHTTPResponse:
 class TestStreamChatCompletion:
     """Tests for streaming chat completion behavior."""
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_reasoning_stream_emits_structured_tool_calls(self, monkeypatch):
         """Tool markup after </think> should emit tool_calls chunks."""
         from vllm_mlx.engine.base import GenerationOutput
@@ -802,7 +833,7 @@ class TestStreamChatCompletion:
             "total_tokens": 10,
         }
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_reasoning_stream_skips_tool_parser_until_markup_appears(
         self, monkeypatch
     ):
