@@ -366,9 +366,11 @@ class MLLMBatchGenerator:
         # Patch attention for BatchKVCache compatibility
         from .patches.qwen3_5_mllm import patch_qwen35_attention_for_batching
         from .patches.gemma4_mllm import patch_gemma4_attention_for_batching
+        from .patches.glm4v_moe_mllm import patch_glm4v_moe_for_batching
 
         patch_qwen35_attention_for_batching()
         patch_gemma4_attention_for_batching()
+        patch_glm4v_moe_for_batching()
 
         self.max_tokens = max_tokens
         self.stop_tokens = stop_tokens or set()
@@ -1040,6 +1042,15 @@ class MLLMBatchGenerator:
                 if req.request_id in self._aborted_request_ids:
                     self._aborted_request_ids.discard(req.request_id)
                     raise PrefillAbortedError(req.request_id)
+
+                # Reset RoPE state for models that cache position_ids
+                # across calls (e.g. GLM-4.6V). Without this, stale
+                # _position_ids from a previous request cause shape
+                # mismatches in multimodal RoPE embedding.
+                lm = self.language_model
+                if hasattr(lm, "_rope_deltas"):
+                    lm._rope_deltas = None
+                    lm._position_ids = None
 
                 # Try prefix cache for all requests (text-only and multimodal).
                 # VLM forward writes the same KV state as language model forward
