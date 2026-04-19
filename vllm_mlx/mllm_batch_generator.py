@@ -1843,10 +1843,14 @@ def install_mtp_mllm(
         # Prefill guard: skip MTP for multi-token input or when no active batch
         # Also skip MTP when batch has multiple active requests (MTP overhead
         # hurts aggregate throughput in concurrent scenarios)
+        # Also skip MTP when logits processors are active (e.g. JSON schema
+        # constrained decoding) — MTP verification uses unconstrained argmax,
+        # so accepted draft tokens would bypass the enforcer.
         if (
             input_tokens.shape[1] > 1
             or batch_gen.active_batch is None
             or len(batch_gen.active_batch) > 1
+            or (logits_processors and any(logits_processors))
         ):
             _skip_state[0] = None
             return _orig_step(
