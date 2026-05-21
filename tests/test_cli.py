@@ -29,6 +29,8 @@ def _serve_args(**overrides):
         "kv_cache_quantization": False,
         "kv_cache_quantization_bits": 8,
         "kv_cache_quantization_group_size": 64,
+        "kv_k_bits": None,
+        "kv_v_bits": None,
         "max_cache_blocks": 1000,
         "max_num_seqs": 32,
         "max_tokens": 16,

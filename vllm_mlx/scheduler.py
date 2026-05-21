@@ -80,6 +80,9 @@ class SchedulerConfig:
     kv_cache_quantization_bits: int = 8
     kv_cache_quantization_group_size: int = 64
     kv_cache_min_quantize_tokens: int = 256
+    # Asymmetric K/V bits (None = use kv_cache_quantization_bits for both)
+    kv_cache_k_bits: Optional[int] = None
+    kv_cache_v_bits: Optional[int] = None
 
     # Paged cache settings (experimental - for memory efficiency)
     use_paged_cache: bool = (
@@ -1190,6 +1193,10 @@ class Scheduler:
                     kv_bits=self.config.kv_cache_quantization_bits,
                     kv_group_size=self.config.kv_cache_quantization_group_size,
                     kv_min_quantize_tokens=self.config.kv_cache_min_quantize_tokens,
+                    kv_k_bits=self.config.kv_cache_k_bits
+                    or self.config.kv_cache_quantization_bits,
+                    kv_v_bits=self.config.kv_cache_v_bits
+                    or self.config.kv_cache_quantization_bits,
                 )
                 self.memory_aware_cache = MemoryAwarePrefixCache(
                     model=model,
@@ -1222,6 +1229,22 @@ class Scheduler:
                 logger.info(
                     f"Prefix cache enabled with max_entries={self.config.prefix_cache_size}"
                 )
+
+        # Install live KV cache quantization if enabled
+        if self.config.kv_cache_quantization:
+            k_bits = (
+                self.config.kv_cache_k_bits or self.config.kv_cache_quantization_bits
+            )
+            v_bits = (
+                self.config.kv_cache_v_bits or self.config.kv_cache_quantization_bits
+            )
+            from vllm_mlx.utils.quantized_kv_cache import install_quantized_kv_cache
+
+            install_quantized_kv_cache(
+                k_bits=k_bits,
+                v_bits=v_bits,
+                group_size=self.config.kv_cache_quantization_group_size,
+            )
 
         # Thread-safe set for deferred aborts (main thread → executor thread)
         # CPython GIL guarantees set.add() and `x in set` are atomic.

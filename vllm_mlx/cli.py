@@ -281,6 +281,8 @@ def serve_command(args):
             kv_cache_quantization_bits=args.kv_cache_quantization_bits,
             kv_cache_quantization_group_size=args.kv_cache_quantization_group_size,
             kv_cache_min_quantize_tokens=args.kv_cache_min_quantize_tokens,
+            kv_cache_k_bits=args.kv_k_bits or args.kv_cache_quantization_bits,
+            kv_cache_v_bits=args.kv_v_bits or args.kv_cache_quantization_bits,
             mllm_prefill_step_size=(
                 args.mllm_prefill_step_size if args.mllm_prefill_step_size > 0 else None
             ),
@@ -314,10 +316,18 @@ def serve_command(args):
             )
             print(f"Memory-aware cache: {cache_info}")
             if args.kv_cache_quantization:
-                print(
-                    f"KV cache quantization: {args.kv_cache_quantization_bits}-bit, "
-                    f"group_size={args.kv_cache_quantization_group_size}"
-                )
+                kv_k = args.kv_k_bits or args.kv_cache_quantization_bits
+                kv_v = args.kv_v_bits or args.kv_cache_quantization_bits
+                if kv_k == kv_v:
+                    print(
+                        f"KV cache quantization: {kv_k}-bit, "
+                        f"group_size={args.kv_cache_quantization_group_size}"
+                    )
+                else:
+                    print(
+                        f"KV cache quantization: K={kv_k}-bit, V={kv_v}-bit, "
+                        f"group_size={args.kv_cache_quantization_group_size}"
+                    )
         elif enable_prefix_cache:
             print(f"Prefix cache: max_entries={args.prefix_cache_size}")
     else:
@@ -535,6 +545,8 @@ def bench_command(args):
             kv_cache_quantization_bits=args.kv_cache_quantization_bits,
             kv_cache_quantization_group_size=args.kv_cache_quantization_group_size,
             kv_cache_min_quantize_tokens=args.kv_cache_min_quantize_tokens,
+            kv_cache_k_bits=args.kv_k_bits or args.kv_cache_quantization_bits,
+            kv_cache_v_bits=args.kv_v_bits or args.kv_cache_quantization_bits,
         )
 
         engine_config = EngineConfig(
@@ -1095,6 +1107,20 @@ Examples:
         default=256,
         help="Minimum tokens for quantization to apply (default: 256)",
     )
+    serve_parser.add_argument(
+        "--kv-k-bits",
+        type=int,
+        default=None,
+        choices=[4, 8],
+        help="Bit width for key cache quantization (overrides --kv-cache-quantization-bits for keys)",
+    )
+    serve_parser.add_argument(
+        "--kv-v-bits",
+        type=int,
+        default=None,
+        choices=[4, 8],
+        help="Bit width for value cache quantization (overrides --kv-cache-quantization-bits for values)",
+    )
     # SSD cache tiering options
     serve_parser.add_argument(
         "--ssd-cache-dir",
@@ -1557,6 +1583,20 @@ Examples:
         type=int,
         default=256,
         help="Minimum tokens for quantization to apply (default: 256)",
+    )
+    bench_parser.add_argument(
+        "--kv-k-bits",
+        type=int,
+        default=None,
+        choices=[4, 8],
+        help="Bit width for key cache quantization (overrides --kv-cache-quantization-bits for keys)",
+    )
+    bench_parser.add_argument(
+        "--kv-v-bits",
+        type=int,
+        default=None,
+        choices=[4, 8],
+        help="Bit width for value cache quantization (overrides --kv-cache-quantization-bits for values)",
     )
     # Paged cache options (experimental)
     bench_parser.add_argument(

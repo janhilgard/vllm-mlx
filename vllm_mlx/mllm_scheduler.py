@@ -81,6 +81,9 @@ class MLLMSchedulerConfig:
     kv_cache_quantization: bool = False
     kv_cache_quantization_bits: int = 8
     kv_cache_quantization_group_size: int = 64
+    # Asymmetric K/V bits (None = use kv_cache_quantization_bits for both)
+    kv_cache_k_bits: Optional[int] = None
+    kv_cache_v_bits: Optional[int] = None
     # Interleaved prefill/decode budget per step (0 = disabled, blocking prefill)
     chunked_prefill_tokens: int = 0
     # Maximum KV cache size per sequence (0 = unbounded; >0 enables RotatingKVCache)
@@ -305,6 +308,10 @@ class MLLMScheduler:
                     kv_quantize=self.config.kv_cache_quantization,
                     kv_bits=self.config.kv_cache_quantization_bits,
                     kv_group_size=self.config.kv_cache_quantization_group_size,
+                    kv_k_bits=self.config.kv_cache_k_bits
+                    or self.config.kv_cache_quantization_bits,
+                    kv_v_bits=self.config.kv_cache_v_bits
+                    or self.config.kv_cache_quantization_bits,
                 )
 
             self.batch_generator = MLLMBatchGenerator(
@@ -342,6 +349,26 @@ class MLLMScheduler:
                         lm,
                         num_draft_tokens=self.config.mtp_num_draft_tokens,
                     )
+
+            # Install live KV cache quantization if enabled
+            if self.config.kv_cache_quantization:
+                k_bits = (
+                    self.config.kv_cache_k_bits
+                    or self.config.kv_cache_quantization_bits
+                )
+                v_bits = (
+                    self.config.kv_cache_v_bits
+                    or self.config.kv_cache_quantization_bits
+                )
+                from vllm_mlx.utils.quantized_kv_cache import (
+                    install_quantized_kv_cache,
+                )
+
+                install_quantized_kv_cache(
+                    k_bits=k_bits,
+                    v_bits=v_bits,
+                    group_size=self.config.kv_cache_quantization_group_size,
+                )
 
     # ========== Sync API (step-based) ==========
 
