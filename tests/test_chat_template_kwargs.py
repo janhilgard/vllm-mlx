@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for chat template kwargs forwarding."""
 
+import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -334,6 +335,59 @@ def test_thinking_disabled_helper(enable_thinking, ctk, expected):
 
 
 @pytest.mark.anyio
+async def test_stream_chat_does_not_add_nemotron_prefix_when_thinking_disabled(
+    monkeypatch,
+):
+    class FakeReasoningParser:
+        def __init__(self, tokenizer=None):
+            self.tokenizer = tokenizer
+
+        def reset_state(self):
+            pass
+
+        def extract_reasoning_streaming(self, previous_text, current_text, delta_text):
+            raise AssertionError("disabled reasoning parser should not consume deltas")
+
+    class FakeEngine:
+        model_name = "Nemotron-test"
+        tokenizer = object()
+
+        async def stream_chat(self, messages, **kwargs):
+            yield GenerationOutput(
+                text="plain answer",
+                new_text="plain answer",
+                finished=True,
+                finish_reason="stop",
+                prompt_tokens=4,
+                completion_tokens=2,
+            )
+
+    monkeypatch.setattr(srv, "_model_name", "test-model")
+    monkeypatch.setattr(srv, "_reasoning_parser_name", "fake")
+    monkeypatch.setattr(srv, "_reasoning_parser", FakeReasoningParser())
+    monkeypatch.setattr(srv, "get_reasoning_parser", lambda _name: FakeReasoningParser)
+    monkeypatch.setattr(srv, "_enable_auto_tool_choice", False)
+    monkeypatch.setattr(srv, "_tool_call_parser", None)
+
+    request = srv.ChatCompletionRequest(
+        model="test-model",
+        messages=[srv.Message(role="user", content="Hello")],
+        stream=True,
+        enable_thinking=False,
+    )
+    chunks = [
+        chunk
+        async for chunk in srv.stream_chat_completion(
+            FakeEngine(), request.messages, request
+        )
+    ]
+
+    body = "".join(chunks)
+    assert "plain answer" in body
+    assert "<think>" not in body
+
+
+@pytest.mark.anyio
 async def test_stream_anthropic_skips_reasoning_parser_when_thinking_disabled():
     from vllm_mlx.reasoning import DeltaMessage
 
@@ -382,3 +436,60 @@ async def test_stream_anthropic_skips_reasoning_parser_when_thinking_disabled():
     assert '"type": "thinking"' not in body
     assert "HEL" in body and "LO" in body
     assert '"type": "text_delta"' in body
+
+
+@pytest.mark.anyio
+async def test_stream_anthropic_flushes_partial_reasoning_marker(monkeypatch):
+    async def fake_stream_chat(messages, **kwargs):
+        yield SimpleNamespace(
+            new_text="thinking</thi",
+            prompt_tokens=3,
+            completion_tokens=2,
+            finished=True,
+            finish_reason="stop",
+        )
+
+    engine = MagicMock(stream_chat=fake_stream_chat, tokenizer=None)
+    messages = [{"role": "user", "content": "Think"}]
+    openai_request = srv.ChatCompletionRequest(
+        model="test-model",
+        messages=[srv.Message(**messages[0])],
+        max_tokens=8,
+    )
+    anthropic_request = srv.AnthropicRequest(
+        model="test-model",
+        max_tokens=8,
+        messages=messages,
+    )
+    prepared = srv.PreparedChatInvocation(
+        messages=messages,
+        chat_kwargs={},
+        response_format=None,
+        json_logits_processor=None,
+    )
+    monkeypatch.setattr(srv, "_reasoning_parser_name", "qwen3")
+    monkeypatch.setattr(srv, "_reasoning_parser", None)
+    monkeypatch.setattr(srv, "_model_name", "test-model")
+
+    body = "".join(
+        [
+            chunk
+            async for chunk in srv._stream_anthropic_messages(
+                engine, openai_request, anthropic_request, prepared
+            )
+        ]
+    )
+    events = [
+        json.loads(line.removeprefix("data: "))
+        for line in body.splitlines()
+        if line.startswith("data: ")
+    ]
+    thinking = "".join(
+        event["delta"]["thinking"]
+        for event in events
+        if event["type"] == "content_block_delta"
+        and event["delta"]["type"] == "thinking_delta"
+    )
+
+    assert thinking == "thinking</thi"
+    assert body.index("thinking</thi") < body.index("message_stop")
