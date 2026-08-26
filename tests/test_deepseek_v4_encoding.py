@@ -16,6 +16,7 @@ from vllm_mlx.utils.deepseek_v4_encoding import (
     THINKING_END_TOKEN,
     THINKING_START_TOKEN,
     apply_chat_template,
+    detect_reasoning_effort_profile,
     encode_arguments_to_dsml,
     encode_messages,
     install,
@@ -129,15 +130,16 @@ class TestResolveThinking:
     @pytest.mark.parametrize(
         "kwargs,expected",
         [
-            ({}, ("thinking", None)),
+            ({}, ("thinking", "high")),
             ({"enable_thinking": False}, ("chat", None)),
-            ({"enable_thinking": True}, ("thinking", None)),
+            ({"enable_thinking": True}, ("thinking", "high")),
             ({"reasoning_effort": "none"}, ("chat", None)),
             ({"reasoning_effort": "low"}, ("thinking", "low")),
-            ({"reasoning_effort": "medium"}, ("thinking", "high")),
+            ({"reasoning_effort": "minimal"}, ("thinking", "low")),
+            ({"reasoning_effort": "medium"}, ("thinking", "low")),
             ({"reasoning_effort": "high"}, ("thinking", "high")),
             ({"reasoning_effort": "max"}, ("thinking", "max")),
-            ({"reasoning_effort": "xhigh"}, ("thinking", "max")),
+            ({"reasoning_effort": "xhigh"}, ("thinking", "high")),
             ({"thinking_mode": "chat"}, ("chat", None)),
             ({"enable_thinking": False, "reasoning_effort": "max"}, ("chat", None)),
         ],
@@ -152,6 +154,55 @@ class TestResolveThinking:
     def test_invalid_thinking_mode_rejected(self):
         with pytest.raises(ValueError, match="thinking_mode"):
             resolve_thinking(thinking_mode="bogus")
+
+    @pytest.mark.parametrize(
+        "effort,expected",
+        [
+            (None, "high"),
+            ("minimal", "high"),
+            ("low", "high"),
+            ("medium", "high"),
+            ("high", "high"),
+            ("xhigh", "high"),
+            ("max", "max"),
+            ("unknown", "high"),
+        ],
+    )
+    def test_preview_profile_mapping(self, effort, expected):
+        assert resolve_thinking(
+            reasoning_effort=effort, reasoning_effort_profile="preview"
+        ) == ("thinking", expected)
+
+    @pytest.mark.parametrize(
+        "profile,effort,marker",
+        [
+            ("preview", "high", None),
+            ("preview", "max", "Absolute maximum"),
+            ("official", "low", None),
+            ("official", "high", "Absolute maximum"),
+            ("official", "max", "Beyond maximum"),
+        ],
+    )
+    def test_profile_golden_prefix(self, profile, effort, marker):
+        prompt = apply_chat_template(
+            [{"role": "user", "content": "Hi"}],
+            reasoning_effort=effort,
+            reasoning_effort_profile=profile,
+        )
+        if marker is None:
+            assert "Reasoning Effort:" not in prompt
+        else:
+            assert marker in prompt
+
+    def test_detects_published_model_profiles(self):
+        assert (
+            detect_reasoning_effort_profile("deepseek-ai/DeepSeek-V4-Flash")
+            == "preview"
+        )
+        assert (
+            detect_reasoning_effort_profile("deepseek-ai/DeepSeek-V4-Flash-0731")
+            == "official"
+        )
 
 
 class TestTools:

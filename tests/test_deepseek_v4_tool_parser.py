@@ -281,6 +281,24 @@ class TestStreaming:
         result = parser.extract_tool_calls_streaming("", "plain", "plain")
         assert result == {"content": "plain"}
 
+    @pytest.mark.parametrize("text", ["2 <", f'{TOOL_CALLS_START}\n<{D}invoke name="f'])
+    def test_finalize_releases_unparsed_suffix(self, text):
+        """EOS must not discard a partial marker or malformed DSML block."""
+        parser = DeepSeekV4ToolParser()
+        previous, content = "", []
+        for delta in text:
+            current = previous + delta
+            result = parser.extract_tool_calls_streaming(previous, current, delta)
+            if result and result.get("content"):
+                content.append(result["content"])
+            previous = current
+
+        result = parser.finalize_streaming(previous)
+        if result and result.get("content"):
+            content.append(result["content"])
+
+        assert "".join(content) == text
+
 
 class TestAutoDetection:
     def test_auto_parser_routes_dsml(self):
@@ -290,6 +308,28 @@ class TestAutoDetection:
         result = AutoToolParser().extract_tool_calls(text)
         assert result.tools_called
         assert result.tool_calls[0]["name"] == "f"
+
+    def test_auto_parser_routes_character_streaming_dsml(self):
+        from vllm_mlx.tool_parsers.auto_tool_parser import AutoToolParser
+
+        text = "Checking.\n\n" + block(invoke("f", param("a", "1", is_str=True)))
+        parser = AutoToolParser()
+        parser.reset()
+        previous, content, calls = "", [], []
+        for delta in text:
+            current = previous + delta
+            result = parser.extract_tool_calls_streaming(previous, current, delta)
+            if result:
+                if result.get("content"):
+                    content.append(result["content"])
+                if result.get("tool_calls"):
+                    calls.append(result["tool_calls"])
+            previous = current
+
+        assert "".join(content).strip() == "Checking."
+        assert D not in "".join(content)
+        assert len(calls) == 1
+        assert calls[0][0]["function"]["name"] == "f"
 
 
 class TestChainedWithReasoningParser:

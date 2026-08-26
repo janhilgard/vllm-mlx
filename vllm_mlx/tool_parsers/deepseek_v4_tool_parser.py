@@ -83,6 +83,10 @@ class DeepSeekV4ToolParser(ToolParser):
     # (api/utils.py), so the model would see a shape it was never trained on
     # and the encoder's own handling would never run.
     SUPPORTS_NATIVE_TOOL_FORMAT = True
+    # DSML's opening marker is tokenized as ``<``, ``｜DSML｜`` and
+    # ``tool_calls>``. The routing layer therefore cannot wait for a complete
+    # marker before invoking this state machine.
+    REQUIRES_EAGER_STREAMING = True
 
     def __init__(self, tokenizer=None):
         super().__init__(tokenizer)
@@ -295,3 +299,24 @@ class DeepSeekV4ToolParser(ToolParser):
         emit = text[: len(text) - hold] if hold else text
         self._emitted_len += len(emit)
         return {"content": emit} if emit else None
+
+    def finalize_streaming(self, current_text: str) -> dict[str, Any] | None:
+        """Resolve withheld text when generation ends.
+
+        A complete invoke without the outer closing marker is parsed just as
+        it is in non-streaming mode. Anything else is returned byte-for-byte
+        so max-token truncation cannot silently discard model output.
+        """
+        if self._emitted_len >= len(current_text):
+            return None
+
+        result = self.extract_tool_calls(current_text)
+        if result.tools_called:
+            self._pending = ""
+            self._emitted_len = len(current_text)
+            return self._format_streaming(result)
+
+        content = current_text[self._emitted_len :]
+        self._pending = ""
+        self._emitted_len = len(current_text)
+        return {"content": content} if content else None

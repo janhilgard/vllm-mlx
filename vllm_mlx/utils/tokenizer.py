@@ -72,7 +72,7 @@ def _install_custom_chat_template(model_name: str, tokenizer):
 
     from .deepseek_v4_encoding import install as install_deepseek_v4
 
-    return install_deepseek_v4(tokenizer)
+    return install_deepseek_v4(tokenizer, model_name=model_name)
 
 
 def load_model_with_fallback(model_name: str, tokenizer_config: dict = None):

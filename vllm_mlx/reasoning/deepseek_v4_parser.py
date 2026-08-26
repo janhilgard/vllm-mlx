@@ -43,12 +43,14 @@ class DeepSeekV4ReasoningParser(DeepSeekR1ReasoningParser):
         # and whether the stream has crossed into tool markup.
         self._emitted_len: int = 0
         self._in_tool_markup: bool = False
+        self._current_text: str = ""
 
     def reset_state(self):
         """Reset state machine for a new streaming request."""
         super().reset_state()
         self._emitted_len = 0
         self._in_tool_markup = False
+        self._current_text = ""
 
     def extract_reasoning(
         self,
@@ -83,6 +85,7 @@ class DeepSeekV4ReasoningParser(DeepSeekR1ReasoningParser):
         reasoning channel and then repeats the whole marker as content once it
         recognises it.
         """
+        self._current_text = current_text
         if self._in_tool_markup:
             new = current_text[self._emitted_len :]
             self._emitted_len = len(current_text)
@@ -128,3 +131,14 @@ class DeepSeekV4ReasoningParser(DeepSeekR1ReasoningParser):
         return super().extract_reasoning_streaming(
             effective_previous, effective_current, effective_delta
         )
+
+    def finalize_stream(self) -> DeltaMessage | None:
+        """Release an incomplete marker prefix retained at end of stream."""
+        if self._emitted_len >= len(self._current_text):
+            return None
+
+        pending = self._current_text[self._emitted_len :]
+        self._emitted_len = len(self._current_text)
+        if self._in_tool_markup or self._phase == "content":
+            return DeltaMessage(content=pending)
+        return DeltaMessage(reasoning=pending)

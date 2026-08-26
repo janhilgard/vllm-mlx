@@ -139,3 +139,13 @@ class TestStreaming:
         assert content.strip() == "Answer."
         for fragment in ("</", "<", "think", ">"):
             assert fragment not in reasoning
+
+    def test_finalize_releases_ordinary_partial_marker(self, parser):
+        """A final ordinary ``<`` is text, not a marker to drop at EOS."""
+        message = parser.extract_reasoning_streaming("", "2 <", "2 <")
+        final = parser.finalize_stream()
+
+        assert message is not None
+        assert message.reasoning == "2 "
+        assert final is not None
+        assert final.reasoning == "<"

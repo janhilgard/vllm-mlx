@@ -20,8 +20,10 @@ preceding user turn as ``<tool_result>`` blocks.
 """
 
 import copy
+import ast
 import json
 import logging
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -120,6 +122,15 @@ REASONING_EFFORT_PROMPTS: dict[str, str] = {
     ),
 }
 DEFAULT_REASONING_EFFORT = "low"
+REASONING_EFFORT_PROFILES: dict[str, dict[str, str]] = {
+    # The first published Flash checkpoint accepts only high/max. Its max
+    # prefix became the official profile's high prefix.
+    "preview": {
+        "high": "",
+        "max": REASONING_EFFORT_PROMPTS["high"],
+    },
+    "official": REASONING_EFFORT_PROMPTS,
+}
 
 TOOLS_TEMPLATE = """## Tools
 
@@ -239,6 +250,7 @@ def render_message(
     thinking_mode: str,
     drop_thinking: bool = True,
     reasoning_effort: str | None = None,
+    reasoning_effort_profile: str = "official",
 ) -> str:
     """Render a single message into its encoded form.
 
@@ -274,14 +286,21 @@ def render_message(
     if tool_calls:
         tool_calls = tool_calls_from_openai_format(tool_calls)
 
-    reasoning_effort = reasoning_effort or DEFAULT_REASONING_EFFORT
-    if reasoning_effort not in REASONING_EFFORT_PROMPTS:
+    if reasoning_effort_profile not in REASONING_EFFORT_PROFILES:
+        raise ValueError(
+            f"Invalid reasoning effort profile: {reasoning_effort_profile}"
+        )
+    effort_prompts = REASONING_EFFORT_PROFILES[reasoning_effort_profile]
+    reasoning_effort = reasoning_effort or (
+        DEFAULT_REASONING_EFFORT if reasoning_effort_profile == "official" else "high"
+    )
+    if reasoning_effort not in effort_prompts:
         raise ValueError(
             f"Invalid reasoning effort: {reasoning_effort}, expected one of "
-            f"{list(REASONING_EFFORT_PROMPTS)}"
+            f"{list(effort_prompts)}"
         )
     if index == 0 and thinking_mode == "thinking":
-        prompt += REASONING_EFFORT_PROMPTS[reasoning_effort]
+        prompt += effort_prompts[reasoning_effort]
 
     if role == "system":
         prompt += content or ""
@@ -542,6 +561,7 @@ def encode_messages(
     drop_thinking: bool = True,
     add_default_bos_token: bool = True,
     reasoning_effort: str | None = None,
+    reasoning_effort_profile: str = "official",
 ) -> str:
     """Encode a conversation into a DeepSeek-V4 prompt string.
 
@@ -595,6 +615,7 @@ def encode_messages(
             thinking_mode=thinking_mode,
             drop_thinking=effective_drop_thinking,
             reasoning_effort=reasoning_effort,
+            reasoning_effort_profile=reasoning_effort_profile,
         )
 
     return prompt
@@ -604,17 +625,15 @@ def encode_messages(
 # OpenAI API adaptation
 # ---------------------------------------------------------------------------
 
-# OpenAI exposes reasoning_effort as low/medium/high; DeepSeek-V4 defines
-# low/high/max prompts plus "no thinking at all". "medium" has no distinct
-# prompt of its own, so it maps onto "high" — as does any unrecognised value,
-# which keeps a typo from silently disabling reasoning.
+# Match the DeepSeek-V4 OpenAI wrapper in vLLM. The official 0731 profile has
+# low/high/max; the earlier preview exposes high/max and normalizes low to high.
 _EFFORT_ALIASES = {
     "low": "low",
     "minimal": "low",
-    "medium": "high",
+    "medium": "low",
     "high": "high",
     "max": "max",
-    "xhigh": "max",
+    "xhigh": "high",
 }
 
 
@@ -622,6 +641,7 @@ def resolve_thinking(
     enable_thinking: bool | None = None,
     reasoning_effort: str | None = None,
     thinking_mode: str | None = None,
+    reasoning_effort_profile: str = "official",
 ) -> tuple[str, str | None]:
     """Map OpenAI-style knobs onto ``(thinking_mode, reasoning_effort)``.
 
@@ -639,17 +659,75 @@ def resolve_thinking(
     else:
         mode = "thinking"
 
-    if mode == "chat" or reasoning_effort in (None, "none"):
+    if mode == "chat":
         return mode, None
 
-    effort = _EFFORT_ALIASES.get(str(reasoning_effort).lower())
+    if reasoning_effort_profile not in REASONING_EFFORT_PROFILES:
+        raise ValueError(
+            f"Invalid reasoning effort profile: {reasoning_effort_profile}"
+        )
+
+    if reasoning_effort is None:
+        effort = "high"
+    else:
+        effort = _EFFORT_ALIASES.get(str(reasoning_effort).lower())
+
     if effort is None:
         logger.warning(
             "Unknown reasoning_effort %r for deepseek_v4, treating as 'high'",
             reasoning_effort,
         )
         effort = "high"
+    if reasoning_effort_profile == "preview" and effort == "low":
+        effort = "high"
     return mode, effort
+
+
+def _profile_from_encoder_source(path: Path) -> str | None:
+    """Detect the checkpoint encoder profile using SGLang's stable symbols."""
+    encoder = path / "encoding" / "encoding_dsv4.py"
+    if not encoder.is_file():
+        return None
+    try:
+        tree = ast.parse(encoder.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError, UnicodeError):
+        return None
+
+    assignments = {
+        target.id: node.value
+        for node in tree.body
+        if isinstance(node, (ast.Assign, ast.AnnAssign))
+        for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+        if isinstance(target, ast.Name)
+    }
+
+    try:
+        default = ast.literal_eval(assignments["DEFAULT_REASONING_EFFORT"])
+        prompts = ast.literal_eval(assignments["REASONING_EFFORT_PROMPTS"])
+    except (KeyError, ValueError, TypeError):
+        default = None
+        prompts = None
+    if (
+        default == "low"
+        and isinstance(prompts, dict)
+        and {"low", "high", "max"}.issubset(prompts)
+    ):
+        return "official"
+    if "REASONING_EFFORT_MAX" in assignments:
+        return "preview"
+    return None
+
+
+def detect_reasoning_effort_profile(model_name: str | None) -> str:
+    """Identify the preview or official Flash prompt profile without network I/O."""
+    if model_name:
+        profile = _profile_from_encoder_source(Path(model_name).expanduser())
+        if profile is not None:
+            return profile
+        if "deepseek-v4-flash-0731" in model_name.lower():
+            return "official"
+    # SGLang also falls back to preview when checkpoint metadata is absent.
+    return "preview"
 
 
 def _attach_tools(
@@ -678,6 +756,7 @@ def apply_chat_template(
     tools: list[dict] | None = None,
     enable_thinking: bool | None = None,
     reasoning_effort: str | None = None,
+    reasoning_effort_profile: str = "official",
     thinking_mode: str | None = None,
     drop_thinking: bool = True,
     add_default_bos_token: bool = True,
@@ -690,7 +769,12 @@ def apply_chat_template(
     the encoder always closes on the assistant prefix, which is the only mode
     the model was trained for.
     """
-    mode, effort = resolve_thinking(enable_thinking, reasoning_effort, thinking_mode)
+    mode, effort = resolve_thinking(
+        enable_thinking,
+        reasoning_effort,
+        thinking_mode,
+        reasoning_effort_profile,
+    )
     conversation = _attach_tools(conversation, tools)
     return encode_messages(
         conversation,
@@ -698,10 +782,11 @@ def apply_chat_template(
         drop_thinking=drop_thinking,
         add_default_bos_token=add_default_bos_token,
         reasoning_effort=effort,
+        reasoning_effort_profile=reasoning_effort_profile,
     )
 
 
-def install(tokenizer: Any) -> Any:
+def install(tokenizer: Any, model_name: str | None = None) -> Any:
     """Route ``tokenizer.apply_chat_template`` through the V4 encoder.
 
     DeepSeek-V4 carries no Jinja template, so the stock path either raises or
@@ -714,7 +799,12 @@ def install(tokenizer: Any) -> Any:
     if getattr(tokenizer, "_deepseek_v4_encoding_installed", False):
         return tokenizer
 
+    profile = detect_reasoning_effort_profile(
+        model_name or getattr(tokenizer, "name_or_path", None)
+    )
+
     def _apply(conversation, tools=None, tokenize=False, **kwargs):
+        kwargs.setdefault("reasoning_effort_profile", profile)
         prompt = apply_chat_template(conversation, tools=tools, **kwargs)
         if tokenize:
             return tokenizer.encode(prompt)
