@@ -492,3 +492,152 @@ class TestRealPoolsideParserParity:
             "".join(texts) == expected.content
         ), f"streamed {texts!r}, non-streaming returned {expected.content!r}"
         assert "After" not in "".join(texts), "text following the call must be dropped"
+
+    def _configure_parsers(self, monkeypatch, reasoning):
+        monkeypatch.setattr(srv, "_enable_auto_tool_choice", True)
+        monkeypatch.setattr(srv, "_tool_call_parser", "poolside_v1")
+        monkeypatch.setattr(srv, "_tool_parser_instance", self._parser())
+        monkeypatch.setattr(srv, "_reasoning_parser", None)
+        monkeypatch.setattr(
+            srv, "_reasoning_parser_name", "poolside_v1" if reasoning else None
+        )
+
+    def _engine_for_deltas(self, deltas):
+        from vllm_mlx.engine.base import GenerationOutput
+
+        async def stream_chat(**kwargs):
+            text = ""
+            for delta in deltas:
+                text += delta
+                yield GenerationOutput(
+                    text=text,
+                    new_text=delta,
+                    finished=False,
+                    finish_reason=None,
+                    prompt_tokens=7,
+                    completion_tokens=1,
+                )
+            yield GenerationOutput(
+                text=text, prompt_tokens=7, completion_tokens=len(deltas)
+            )
+
+        return SimpleNamespace(
+            model_name="test-model",
+            preserve_native_tool_format=False,
+            stream_chat=stream_chat,
+        )
+
+    @pytest.mark.parametrize("reasoning", [False, True])
+    @pytest.mark.parametrize("separator", [" ", "\n\n", "\n    "])
+    @pytest.mark.anyio
+    async def test_openai_preserves_whitespace_between_text_deltas(
+        self, monkeypatch, reasoning, separator
+    ):
+        from vllm_mlx.api.models import ChatCompletionRequest
+
+        self._configure_parsers(monkeypatch, reasoning)
+        call = self.OUTPUT.removeprefix("Before").removesuffix("After")
+        prefix = "<think>Plan</think>" if reasoning else ""
+        engine = self._engine_for_deltas([prefix + "Hello", separator + "world" + call])
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "write it"}],
+            stream=True,
+            tools=self.REQUEST_TOOLS,
+        )
+
+        chunks = await _collect(
+            srv.stream_chat_completion(engine, request.messages, request)
+        )
+        payloads = _data_payloads(chunks)
+        deltas = [p["choices"][0]["delta"] for p in payloads if p.get("choices")]
+        assert (
+            "".join(d.get("content") or "" for d in deltas)
+            == "Hello" + separator + "world"
+        )
+        calls = [call for d in deltas for call in (d.get("tool_calls") or [])]
+        assert len(calls) == 1
+        assert calls[0]["function"]["name"] == "write_file"
+        assert json.loads(calls[0]["function"]["arguments"]) == {"path": "/tmp/a.py"}
+        assert any(
+            p["choices"][0].get("finish_reason") == "tool_calls"
+            for p in payloads
+            if p.get("choices")
+        )
+        assert any("[DONE]" in chunk for chunk in chunks)
+        if reasoning:
+            assert "".join(d.get("reasoning_content") or "" for d in deltas) == "Plan"
+
+    @pytest.mark.parametrize("reasoning", [False, True])
+    @pytest.mark.parametrize("chunking", ["whole", "suffix-separate", "all-separate"])
+    @pytest.mark.anyio
+    async def test_responses_keeps_only_text_before_the_tool_call(
+        self, monkeypatch, reasoning, chunking
+    ):
+        from vllm_mlx.api.models import ChatCompletionRequest
+        from vllm_mlx.api.responses_models import ResponsesRequest
+
+        self._configure_parsers(monkeypatch, reasoning)
+        call = self.OUTPUT.removeprefix("Before").removesuffix("After")
+        chunks_in = {
+            "whole": [self.OUTPUT],
+            "suffix-separate": ["Before" + call, "After"],
+            "all-separate": ["Before", call, "After"],
+        }[chunking]
+        if reasoning:
+            chunks_in[0] = "<think>Plan</think>" + chunks_in[0]
+        engine = self._engine_for_deltas(chunks_in)
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "write it"}],
+            stream=True,
+            tools=self.REQUEST_TOOLS,
+        )
+        monkeypatch.setattr(
+            srv,
+            "_prepare_streaming_responses_request",
+            lambda req: (engine, request, request.messages, {}),
+        )
+
+        payloads = _data_payloads(
+            await _collect(
+                srv._stream_responses_request(
+                    ResponsesRequest(
+                        model="test-model", input="write it", stream=True, store=False
+                    )
+                )
+            )
+        )
+        text_events = [p for p in payloads if p["type"] == "response.output_text.delta"]
+        assert "".join(p["delta"] for p in text_events) == "Before"
+        calls = [
+            p
+            for p in payloads
+            if p["type"] == "response.output_item.added"
+            and p["item"]["type"] == "function_call"
+        ]
+        assert len(calls) == 1
+        assert text_events[-1]["sequence_number"] < calls[0]["sequence_number"]
+        completed = next(
+            p["response"] for p in payloads if p["type"] == "response.completed"
+        )
+        assert completed["status"] == "completed"
+        messages = [item for item in completed["output"] if item["type"] == "message"]
+        assert [part["text"] for item in messages for part in item["content"]] == [
+            "Before"
+        ]
+        final_calls = [
+            item for item in completed["output"] if item["type"] == "function_call"
+        ]
+        assert len(final_calls) == 1
+        assert final_calls[0]["name"] == "write_file"
+        assert json.loads(final_calls[0]["arguments"]) == {"path": "/tmp/a.py"}
+        if reasoning:
+            assert (
+                "".join(
+                    p["delta"]
+                    for p in payloads
+                    if p["type"] == "response.reasoning_text.delta"
+                )
+                == "Plan"
+            )

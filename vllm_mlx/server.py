@@ -2807,6 +2807,24 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
     tool_parser = _get_streaming_tool_parser(chat_request, engine)
     tool_accumulated_text = ""
     tool_markup_possible = _requires_eager_tool_streaming(tool_parser)
+    tool_calls_detected = False
+    drop_post_call_text = _parser_drops_text_after_tool_call(tool_parser)
+
+    def _tool_result_content(result: dict | None) -> str:
+        """Keep incremental text consistent across both Responses branches."""
+        nonlocal tool_calls_detected
+        if result is None:
+            return ""
+        if drop_post_call_text and tool_calls_detected:
+            return ""
+        content = result.get("content") or ""
+        if result.get("tool_calls"):
+            tool_calls_detected = True
+            if drop_post_call_text:
+                content = _assistant_text_before_tool_call(
+                    tool_parser, tool_accumulated_text, content
+                )
+        return content
 
     async for output in engine.stream_chat(messages=messages, **chat_kwargs):
         last_output = output
@@ -2874,12 +2892,7 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
                     tool_result = _finalize_streaming_tool_result(
                         tool_parser, tool_accumulated_text, tool_result
                     )
-                # Text may accompany the tool calls in the same delta;
-                # emit it rather than dropping it with them.
-                if tool_result is None:
-                    content = ""
-                else:
-                    content = tool_result.get("content", "")
+                content = _tool_result_content(tool_result)
 
             if content:
                 for event in _start_text_item():
@@ -2927,14 +2940,7 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
                     tool_result = _finalize_streaming_tool_result(
                         tool_parser, tool_accumulated_text, tool_result
                     )
-                if tool_result is None:
-                    continue
-                if "tool_calls" in tool_result:
-                    content = tool_result.get("content", "")
-                    if not content:
-                        continue
-                else:
-                    content = tool_result.get("content", "")
+                content = _tool_result_content(tool_result)
 
         if not content:
             continue
@@ -3393,7 +3399,9 @@ def _assistant_text_before_tool_call(
     after = _text_after_tool_call(parser, accumulated_text)
     if after and content.endswith(after):
         content = content[: -len(after)]
-    return content.strip()
+    # This delta may continue previously emitted text. Its whitespace can be
+    # a word separator, paragraph break, or indentation and must be preserved.
+    return content
 
 
 def _parse_streaming_tool_content(
