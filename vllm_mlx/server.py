@@ -299,11 +299,14 @@ def _resolve_request_max_tokens(requested_value: int | None) -> int:
 
 def _resolve_chat_template_kwargs(
     request_value: dict[str, object] | None,
+    request_reasoning_effort: str | None = None,
 ) -> dict[str, object]:
-    """Resolve chat template kwargs: request > server default > empty dict."""
+    """Resolve chat kwargs: server default < effort < explicit request kwargs."""
     resolved: dict[str, object] = {}
     if _default_chat_template_kwargs:
         resolved.update(_default_chat_template_kwargs)
+    if request_reasoning_effort is not None:
+        resolved["reasoning_effort"] = request_reasoning_effort
     if request_value:
         resolved.update(request_value)
     return resolved
@@ -815,7 +818,8 @@ def _prepare_chat_completion_invocation(
     if specprefill_backbone_pct is not None:
         chat_kwargs["specprefill_backbone_pct"] = specprefill_backbone_pct
     resolved_chat_template_kwargs = _resolve_chat_template_kwargs(
-        request.chat_template_kwargs
+        request.chat_template_kwargs,
+        request_reasoning_effort=getattr(request, "reasoning_effort", None),
     )
     if resolved_chat_template_kwargs:
         chat_kwargs["chat_template_kwargs"] = resolved_chat_template_kwargs
@@ -3860,8 +3864,11 @@ async def metrics():
     if not _metrics.enabled:
         raise HTTPException(status_code=404, detail="Metrics endpoint is disabled")
 
+    engine = (
+        _model_manager.get_metrics_engine() if _model_manager is not None else _engine
+    )
     payload, content_type = _metrics.render_metrics(
-        engine=_engine,
+        engine=engine,
         mcp_manager=_mcp_manager,
     )
     return Response(content=payload, headers={"Content-Type": content_type})
